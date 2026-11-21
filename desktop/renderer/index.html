@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: file:; style-src 'self'; script-src 'self'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Unoscil</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="appbar">
+        <div class="brand">
+          <div class="brand-mark">U</div>
+          <div class="brand-text">
+            <span class="brand-name">Unoscil</span>
+            <span class="brand-sub">本地剪贴板历史</span>
+          </div>
+        </div>
+        <div class="search-wrap">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 3a7.5 7.5 0 1 0 4.65 13.39l4.23 4.23 1.42-1.42-4.23-4.23A7.5 7.5 0 0 0 10.5 3Zm0 2a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11Z"/></svg>
+          <input id="search" type="search" placeholder="搜索剪贴板历史…" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="window-controls">
+          <button id="btn-min" class="win-btn" title="最小化" aria-label="最小化">
+            <svg viewBox="0 0 12 12"><path d="M2 6h8" stroke-width="1.2"/></svg>
+          </button>
+          <button id="btn-max" class="win-btn" title="最大化 / 还原" aria-label="最大化或还原">
+            <svg viewBox="0 0 12 12"><path d="M2.5 2.5h7v7h-7z" stroke-width="1.2"/></svg>
+          </button>
+          <button id="btn-close" class="win-btn close" title="关闭" aria-label="关闭">
+            <svg viewBox="0 0 12 12"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke-width="1.2"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="body">
+        <aside class="sidebar">
+          <div class="side-section">
+            <p class="side-label">筛选</p>
+            <div class="chips" id="filters">
+              <button class="chip active" data-filter="all">全部</button>
+              <button class="chip" data-filter="text">文本</button>
+              <button class="chip" data-filter="image">图片</button>
+              <button class="chip" data-filter="pinned">收藏</button>
+            </div>
+          </div>
+
+          <div class="side-section stats">
+            <p class="side-label">统计</p>
+            <div class="stat-row"><span>总条目</span><strong id="stat-total">0</strong></div>
+            <div class="stat-row"><span>已收藏</span><strong id="stat-pinned">0</strong></div>
+            <div class="stat-row"><span>图片</span><strong id="stat-image">0</strong></div>
+          </div>
+
+          <div class="side-section grow">
+            <p class="side-label">操作</p>
+            <button class="side-action" id="btn-clear-unpinned">
+              <span class="dot warn"></span>清空未收藏
+            </button>
+            <button class="side-action" id="btn-clear">
+              <span class="dot danger"></span>清空全部历史
+            </button>
+            <button class="side-action" id="btn-data-dir">
+              <span class="dot"></span>打开数据目录
+            </button>
+            <button class="side-action" id="btn-about">
+              <span class="dot accent"></span>关于与联系
+            </button>
+          </div>
+
+          <div class="monitor">
+            <span class="pulse"></span>
+            <div>
+              <p class="monitor-title">正在监听剪贴板</p>
+              <p class="monitor-sub" id="monitor-sub">复制任何内容都会自动收录</p>
+            </div>
+          </div>
+        </aside>
+
+        <main class="content">
+          <div class="content-head">
+            <div>
+              <h1 id="list-title">全部记录</h1>
+              <p id="list-sub">最近复制的文本与图片会出现在这里</p>
+            </div>
+            <div class="head-actions">
+              <button class="ghost" id="btn-refresh">刷新</button>
+            </div>
+          </div>
+          <div class="list" id="list"></div>
+          <div class="empty" id="empty" hidden>
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24"><path d="M9 3h6v2H9zM7 5h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm0 4v10h10V9Z"/></svg>
+            </div>
+            <h2>还没有记录</h2>
+            <p>复制一段文字或截一张图，Unoscil 会立即收录。</p>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <div class="sheet-backdrop" id="sheet" hidden>
+      <div class="sheet">
+        <div class="sheet-head">
+          <h2>关于 Unoscil</h2>
+          <button class="win-btn" id="sheet-close" aria-label="关闭">
+            <svg viewBox="0 0 12 12"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke-width="1.2"/></svg>
+          </button>
+        </div>
+        <div class="sheet-body">
+          <div class="about-hero">
+            <div class="brand-mark large">U</div>
+            <div>
+              <p class="about-name">Unoscil</p>
+              <p class="about-version" id="about-version">版本 —</p>
+            </div>
+          </div>
+          <p class="about-desc">跨设备剪贴板同步工具的桌面版本。本机剪贴板历史完全保存在本地，不上传云端。</p>
+          <div class="about-row">
+            <span>联系作者</span>
+            <button class="link" id="about-mail">241644244@qq.com</button>
+          </div>
+          <div class="about-row">
+            <span>开源许可</span>
+            <span>MIT License</span>
+          </div>
+          <div class="about-row">
+            <span>原项目作者</span>
+            <span>JericX · mkdir700</span>
+          </div>
+          <div class="about-row">
+            <span>数据目录</span>
+            <button class="link" id="about-datadir">打开</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

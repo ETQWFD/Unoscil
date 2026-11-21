@@ -1,0 +1,26 @@
+appId: ${APP_ID}
+---
+- runFlow: open.yaml
+- scrollUntilVisible:
+    element:
+      id: settings-background
+    direction: UP
+- tapOn:
+    id: settings-background
+- tapOn:
+    id: background-tasks
+- tapOn: "Enable"
+- tapOn:
+    text: "(?i)deny"
+    optional: true
+- launchApp:
+    stopApp: false
+- back
+- runFlow:
+    when:
+      visible: "Settings"
+    commands:
+      - back
+- launchApp:
+    stopApp: false
+- runFlow: ../../assertions/home-ready.yaml

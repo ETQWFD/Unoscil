@@ -1,0 +1,615 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+source "$SCRIPT_DIR/engine-build-storage.sh"
+ENGINE_ROOT="${UC_ENGINE_REPOSITORY:-$PROJECT_ROOT/../Engine}"
+LOCAL_ENGINE_ROOT="$PROJECT_ROOT/modules/uc-engine/.artifacts/local"
+LOCAL_ENGINE_OVERRIDE=""
+if [ -f "$LOCAL_ENGINE_ROOT/source.json" ]; then
+  LOCAL_ENGINE_OVERRIDE="$(node -e 'const p = require(process.argv[1]).repository; if (typeof p !== "string" || !p.startsWith("/")) process.exit(1); process.stdout.write(p)' "$LOCAL_ENGINE_ROOT/source.json")"
+  ENGINE_ROOT="$LOCAL_ENGINE_OVERRIDE"
+fi
+export PROJECT_ROOT SCRIPT_DIR LOCAL_ENGINE_BUILD_ROOT LOCAL_ENGINE_ROOT
+INSTALL_ENGINE_COMMIT=""
+DEFAULT_IOS_DEVICE="marks iPhone"
+DEFAULT_ANDROID_DEVICE="7bac761b"
+IOS_INSTALL_VARIANT="${UC_IOS_INSTALL_VARIANT:-development}"
+ANDROID_INSTALL_VARIANT="${UC_ANDROID_INSTALL_VARIANT:-development}"
+
+usage() {
+  cat <<EOF
+Install Unoscil on connected physical devices.
+
+Usage:
+  npm run install:dev
+  npm run install:dev:ios [iOS device name or identifier]
+  npm run install:dev:android [Android device identifier]
+  npm run install:release:ios [iOS device name or identifier]
+  npm run install:release:android [Android device identifier]
+  npm run install:test:ios [iOS device name or identifier]
+  npm run install:test:android [Android device identifier]
+  bash scripts/install-dev-device.sh [ios|android|all] [device]
+
+Defaults:
+  iOS:     $DEFAULT_IOS_DEVICE
+  Android: $DEFAULT_ANDROID_DEVICE
+
+The app is built as the separate development version and does not replace the
+production app. It uses the Engine revision pinned in modules/uc-engine/core-source.json
+and reuses verified artifacts when available. This command does not start Metro; run npm start separately
+when you need to load JavaScript from this checkout.
+
+install:release:ios builds the production Unoscil identity in Release mode,
+installs and launches it, then restores the generated iOS project to the
+development identity. It replaces an installed production Unoscil app.
+install:release:android does the same for the production Android app.
+
+install:test:ios and install:test:android build the separate test identity
+(Unoscil Test, ".test" identifiers) in Release mode with a release Engine, so
+release behavior can be measured without replacing the production or
+development app. If adb cannot install the Android test app (for example when
+the phone blocks USB installs), the APK is copied to
+Download/UnoscilRelease on the phone for a manual install.
+
+For temporary local Engine testing (including uncommitted changes):
+  npm run core:patch -- /path/to/Engine
+  npm run install:dev:ios
+  npm run install:dev:android
+  npm run install:release:ios
+  npm run install:release:android
+  npm run install:test:ios
+  npm run install:test:android
+  npm run core:unpatch
+The override applies only to local device installs and leaves the project pin unchanged.
+EOF
+}
+
+# Release identities: <bundle id> <display name> <Xcode project name> for iOS,
+# <application id> <display name> for Android.
+ios_release_identity() {
+  case "$1" in
+    production) echo "app.unoscil.Unoscil|Unoscil|Unoscil" ;;
+    test) echo "app.unoscil.Unoscil.test|Unoscil Test|UnoscilTest" ;;
+    *) echo "Unsupported iOS release variant: $1" >&2; exit 2 ;;
+  esac
+}
+
+android_release_identity() {
+  case "$1" in
+    production) echo "app.unoscil.android" ;;
+    test) echo "app.unoscil.android.test" ;;
+    *) echo "Unsupported Android release variant: $1" >&2; exit 2 ;;
+  esac
+}
+
+assert_release_ios_project() {
+  local variant="$1"
+  local bundle_id="$2"
+  local project_name="$3"
+  local project_file="$PROJECT_ROOT/ios/$project_name.xcodeproj/project.pbxproj"
+  local expected_identifier="PRODUCT_BUNDLE_IDENTIFIER = $bundle_id;"
+
+  if [ ! -f "$project_file" ] || ! grep -Fq -- "$expected_identifier" "$project_file"; then
+    echo "The iOS project is not prepared as the $variant app." >&2
+    echo "Regenerate it with APP_VARIANT=$variant before installing." >&2
+    exit 1
+  fi
+}
+
+assert_release_android_project() {
+  local variant="$1"
+  local application_id="$2"
+  local project_file="$PROJECT_ROOT/android/app/build.gradle"
+  local expected_identifier="applicationId '$application_id'"
+
+  if [ ! -f "$project_file" ] || ! grep -Fq -- "$expected_identifier" "$project_file"; then
+    echo "The Android project is not prepared as the $variant app." >&2
+    echo "Regenerate it with APP_VARIANT=$variant before installing." >&2
+    exit 1
+  fi
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Required command is unavailable: $1" >&2
+    exit 1
+  fi
+}
+
+assert_development_project() {
+  local platform="$1"
+  local expected_identifier
+  local project_file
+
+  case "$platform" in
+    ios)
+      expected_identifier='PRODUCT_BUNDLE_IDENTIFIER = app.unoscil.Unoscil.dev;'
+      project_file="$PROJECT_ROOT/ios/UnoscilDev.xcodeproj/project.pbxproj"
+      ;;
+    android)
+      expected_identifier="applicationId 'app.unoscil.android.dev'"
+      project_file="$PROJECT_ROOT/android/app/build.gradle"
+      ;;
+  esac
+
+  if [ ! -f "$project_file" ] || ! grep -Fq -- "$expected_identifier" "$project_file"; then
+    echo "The $platform project is not prepared as the development app." >&2
+    echo "Regenerate it with APP_VARIANT=development before installing." >&2
+    exit 1
+  fi
+}
+
+# Restore and verify the pinned iOS archive from its commit or release cache.
+restore_pinned_ios_engine_impl() {
+  local module_dir="$PROJECT_ROOT/modules/uc-engine"
+  local cache_dir
+  local archive
+  local binding
+  local module_framework="$module_dir/ios/UniClipboardEngine.xcframework"
+
+  cache_dir="$module_dir/.artifacts/$(node -e '
+    const pin = require(process.argv[1]);
+    process.stdout.write(pin.artifactSource === "commit" ? `commit-${pin.sourceCommit}` : pin.version);
+  ' "$module_dir/core-source.json")"
+  archive="$cache_dir/UniClipboardEngine.xcframework.zip"
+  binding="$cache_dir/uc_engine_uniffi.swift"
+  if [ ! -f "$archive" ] || [ ! -f "$binding" ]; then
+    echo "The pinned iOS Engine cache is incomplete: $cache_dir" >&2
+    echo "Run npm run core:prepare -- --platform ios before installing." >&2
+    return 1
+  fi
+
+  if [ -d "$module_framework" ]; then
+    find "$module_framework" -depth -delete
+  fi
+  unzip -q "$archive" -d "$module_dir/ios"
+  find "$module_framework" -name '._*' -delete
+  cp "$binding" "$module_dir/ios/Bindings/uc_engine_uniffi.swift"
+  node "$SCRIPT_DIR/verify-unified-engine-core.mjs" --prepared --platform ios
+}
+
+restore_cached_local_ios_engine_impl() {
+  local expected_commit="$1"
+  local cache_dir="$LOCAL_ENGINE_ROOT/ios-cache"
+  local module_dir="$PROJECT_ROOT/modules/uc-engine/ios"
+  local module_framework="$module_dir/UniClipboardEngine.xcframework"
+  local pending
+
+  # Only reuse verified dev output, never relabel a published release as a dev build.
+  if node "$SCRIPT_DIR/verify-unified-engine-core.mjs" --local-prepared --build-profile dev --source-commit "$expected_commit" >/dev/null 2>&1; then
+    if ! node "$SCRIPT_DIR/verify-unified-engine-core.mjs" --local-prepared --build-profile dev --local-artifacts "$cache_dir" --source-commit "$expected_commit" >/dev/null 2>&1; then
+      pending="$(mktemp -d "$LOCAL_ENGINE_ROOT/ios-cache.XXXXXX")"
+      ditto "$module_framework" "$pending/UniClipboardEngine.xcframework"
+      cp "$module_dir/Bindings/uc_engine_uniffi.swift" "$pending/uc_engine_uniffi.swift"
+      cp "$LOCAL_ENGINE_ROOT/local-prepared.json" "$pending/local-prepared.json"
+      if ! node "$SCRIPT_DIR/verify-unified-engine-core.mjs" --local-prepared --build-profile dev --local-artifacts "$pending" --source-commit "$expected_commit"; then
+        rm -rf "$pending"
+        return 1
+      fi
+      rm -rf "$cache_dir"
+      mv "$pending" "$cache_dir"
+    fi
+    echo "Using prepared iOS Engine ($expected_commit); skipping Engine compilation"
+    return
+  fi
+
+  if ! node "$SCRIPT_DIR/verify-unified-engine-core.mjs" --local-prepared --build-profile dev --local-artifacts "$cache_dir" --source-commit "$expected_commit" >/dev/null 2>&1; then
+    return 1
+  fi
+  echo "Restoring cached iOS Engine ($expected_commit); skipping Engine compilation"
+  mkdir -p "$module_dir/Bindings"
+  find "$module_framework" -depth -delete 2>/dev/null || true
+  ditto "$cache_dir/UniClipboardEngine.xcframework" "$module_framework"
+  cp "$cache_dir/uc_engine_uniffi.swift" "$module_dir/Bindings/uc_engine_uniffi.swift"
+  cp "$cache_dir/local-prepared.json" "$LOCAL_ENGINE_ROOT/local-prepared.json"
+  node "$SCRIPT_DIR/verify-unified-engine-core.mjs" --local-prepared --build-profile dev --source-commit "$expected_commit"
+}
+
+export -f restore_pinned_ios_engine_impl
+# Serialize pinned restoration while preserving explicitly selected local Engine output.
+restore_pinned_ios_engine() {
+  # Local development owns its output and must not require or restore release artifacts.
+  if [ -n "$LOCAL_ENGINE_OVERRIDE" ]; then
+    return 0
+  fi
+  uc_engine_publish "$PROJECT_ROOT" bash -euo pipefail -c restore_pinned_ios_engine_impl
+}
+
+restore_development_ios_project() {
+  restore_pinned_ios_engine
+  bash "$SCRIPT_DIR/prepare-ios-development-project.sh"
+}
+
+restore_development_android_project() {
+  APP_VARIANT=development npx expo prebuild --platform android --no-install
+}
+
+export -f restore_cached_local_ios_engine_impl
+restore_cached_local_ios_engine() {
+  uc_engine_publish "$PROJECT_ROOT" bash -euo pipefail -c 'restore_cached_local_ios_engine_impl "$@"' _ "$@"
+}
+
+prepare_local_cargo_home() {
+  local cargo_home="${UC_ENGINE_STORAGE_BUILD_DIR:-$LOCAL_ENGINE_BUILD_ROOT}/cargo-home"
+  local host_cargo_home="${CARGO_HOME:-${HOME:-}/.cargo}"
+  local cache_name
+
+  mkdir -p "$cargo_home"
+  for cache_name in registry git; do
+    if [ ! -e "$cargo_home/$cache_name" ] && [ -d "$host_cargo_home/$cache_name" ]; then
+      ln -s "$host_cargo_home/$cache_name" "$cargo_home/$cache_name"
+    fi
+  done
+  if [ ! -f "$cargo_home/config.toml" ]; then
+    {
+      printf '%s\n' '[build]'
+      if command -v sccache >/dev/null 2>&1; then
+        printf '%s\n' 'rustc-wrapper = "sccache"'
+      fi
+    } > "$cargo_home/config.toml"
+  fi
+  export CARGO_HOME="$cargo_home"
+}
+
+prepare_local_engine_cargo_config() {
+  local worktree="$1"
+  local cargo_config="$worktree/.cargo/config.toml"
+
+  {
+    printf '\n%s\n' '[patch."https://github.com/UniClipboard/Engine.git"]'
+    printf 'uc-engine = { path = "%s/crates/uc-engine" }\n' "$worktree"
+    printf 'uc-observability-contract = { path = "%s/crates/uc-observability-contract" }\n' "$worktree"
+  } >> "$cargo_config"
+}
+
+prepare_install_engine() {
+  local platform="$1"
+  local android_marker="$LOCAL_ENGINE_BUILD_ROOT/uc-engine-uniffi-dist/android/source-commit.txt"
+  local marker_file
+  local prepared_commit
+  local source_commit
+  local worktree
+  local build_profile="dev"
+
+  if { [ "$platform" = "ios" ] && [ "$IOS_INSTALL_VARIANT" != "development" ]; } ||
+     { [ "$platform" = "android" ] && [ "$ANDROID_INSTALL_VARIANT" != "development" ]; }; then
+    build_profile="release"
+  fi
+
+  require_command git
+  require_command node
+  if [ ! -f "$ENGINE_ROOT/Cargo.toml" ]; then
+    echo "Engine repository is not available: $ENGINE_ROOT" >&2
+    echo "Set UC_ENGINE_REPOSITORY to its local path, then run this command again." >&2
+    exit 1
+  fi
+
+  mkdir -p "$LOCAL_ENGINE_ROOT"
+  prepare_local_cargo_home
+  if [ -n "$LOCAL_ENGINE_OVERRIDE" ]; then
+    echo "Preparing $platform Engine from current local files: $ENGINE_ROOT"
+    # Always invoke Cargo so edits at the same commit cannot reuse stale packages.
+    case "$platform" in
+      ios)
+        UC_ENGINE_UNIFFI_BUILD_PROFILE="$build_profile" UC_ENGINE_LOCAL_TARGET_DIR="$LOCAL_ENGINE_BUILD_ROOT" \
+          bash "$SCRIPT_DIR/prepare-local-unified-engine-core.sh" "$ENGINE_ROOT"
+        ;;
+      android)
+        (
+          cd "$ENGINE_ROOT"
+          UC_ENGINE_UNIFFI_BUILD_PROFILE="$build_profile" UC_ENGINE_UNIFFI_TARGET_DIR="$LOCAL_ENGINE_BUILD_ROOT" \
+            UC_ENGINE_UNIFFI_BUILD_LOCKED=1 \
+            uc_engine_run_build bindings/uc-engine-uniffi/scripts/build-android-aar.sh
+          if [ "$(cat "$android_marker" 2>/dev/null || true)" != "$(git rev-parse HEAD)" ] ||
+              [ "$(cat "${android_marker%/*}/build-profile.txt" 2>/dev/null || true)" != "$build_profile" ]; then
+            echo "Engine packaging did not produce the requested $build_profile build; update its build scripts" >&2
+            exit 1
+          fi
+        )
+        ;;
+      *) echo "Unsupported Engine platform: $platform" >&2; return 2 ;;
+    esac
+    return
+  fi
+  if [ -z "$INSTALL_ENGINE_COMMIT" ]; then
+    INSTALL_ENGINE_COMMIT="$(node -p 'require(process.argv[1]).sourceCommit' "$PROJECT_ROOT/modules/uc-engine/core-source.json")"
+    if ! git -C "$ENGINE_ROOT" cat-file -e "$INSTALL_ENGINE_COMMIT^{commit}"; then
+      git -C "$ENGINE_ROOT" fetch origin "$INSTALL_ENGINE_COMMIT"
+    fi
+  fi
+  source_commit="$INSTALL_ENGINE_COMMIT"
+  case "$platform" in
+    ios)
+      if [ "$build_profile" = "dev" ] && restore_cached_local_ios_engine "$source_commit"; then
+        return
+      fi
+      ;;
+    android)
+      marker_file="$android_marker"
+      prepared_commit="$(cat "$marker_file" 2>/dev/null || true)"
+      if [ "$prepared_commit" = "$source_commit" ] &&
+          [ "$(cat "${android_marker%/*}/build-profile.txt" 2>/dev/null || true)" = "$build_profile" ]; then
+        return
+      fi
+      ;;
+    *)
+      echo "Unsupported Engine platform: $platform" >&2
+      exit 2
+      ;;
+  esac
+
+  echo "Preparing $platform Engine pinned by mobile ($source_commit)"
+  worktree="$(mktemp -d "$LOCAL_ENGINE_ROOT/engine-install.XXXXXX")"
+  rmdir "$worktree"
+  bash "$SCRIPT_DIR/engine-source-checkout.sh" "$ENGINE_ROOT" "$worktree" "$source_commit"
+  prepare_local_engine_cargo_config "$worktree"
+  trap 'git -C "$ENGINE_ROOT" worktree remove --force "$worktree"' RETURN
+  case "$platform" in
+    ios)
+      UC_ENGINE_BUILD_TOOLS_ROOT="$ENGINE_ROOT" UC_ENGINE_UNIFFI_BUILD_PROFILE="$build_profile" UC_ENGINE_LOCAL_TARGET_DIR="$LOCAL_ENGINE_BUILD_ROOT" \
+        bash "$SCRIPT_DIR/prepare-local-unified-engine-core.sh" "$worktree"
+      if [ "$build_profile" = "dev" ]; then
+        restore_cached_local_ios_engine "$source_commit"
+      fi
+      ;;
+    android)
+      (
+        cd "$worktree"
+        UC_ENGINE_UNIFFI_BUILD_PROFILE="$build_profile" UC_ENGINE_UNIFFI_TARGET_DIR="$LOCAL_ENGINE_BUILD_ROOT" \
+          UC_ENGINE_UNIFFI_BUILD_LOCKED=1 \
+          uc_engine_run_build "$ENGINE_ROOT/bindings/uc-engine-uniffi/scripts/build-android-aar.sh" "$worktree"
+        if [ "$(cat "${android_marker%/*}/build-profile.txt" 2>/dev/null || true)" != "$build_profile" ]; then
+          echo "Engine packaging did not produce the requested $build_profile build" >&2
+          exit 1
+        fi
+      )
+      ;;
+  esac
+  trap - RETURN
+  git -C "$ENGINE_ROOT" worktree remove --force "$worktree"
+}
+
+# Build and install the requested iOS variant, preserving the original failure on cleanup.
+install_ios() {
+  local device="$1"
+  local bindings_cache="${UC_ENGINE_STORAGE_BUILD_DIR:-$LOCAL_ENGINE_BUILD_ROOT}/ios-bindings-cache"
+  require_command xcrun
+  require_command unzip
+
+  if ! xcrun devicectl list devices 2>/dev/null | grep -Fq -- "$device"; then
+    echo "iOS device is not available: $device" >&2
+    echo "Unlock the phone, connect it, then try again or pass its name explicitly." >&2
+    exit 1
+  fi
+
+  case "$IOS_INSTALL_VARIANT" in
+    production|test)
+      install_ios_release "$device" "$IOS_INSTALL_VARIANT"
+      return
+      ;;
+    development) ;;
+    *)
+      echo "Unsupported iOS install variant: $IOS_INSTALL_VARIANT" >&2
+      exit 2
+      ;;
+  esac
+
+  # Confirm cleanup can restore the pinned artifacts before replacing them for installation.
+  restore_pinned_ios_engine
+  bash "$SCRIPT_DIR/prepare-ios-development-project.sh"
+  assert_development_project ios
+  trap 'status=$?; if restore_pinned_ios_engine; then restore_status=0; else restore_status=$?; fi; if [ "$status" -eq 0 ] && [ "$restore_status" -ne 0 ]; then status="$restore_status"; fi; exit "$status"' EXIT
+  UC_ENGINE_UNIFFI_SLICE=device \
+    UC_ENGINE_UNIFFI_BINDINGS_CACHE_DIR="$bindings_cache" \
+    prepare_install_engine ios
+  # Keep Expo C++ view layouts consistent with this Debug build and React Native.
+  # React Native 0.86 also skips required codegen when deprecation suppression is enabled.
+  RCT_IGNORE_PODS_DEPRECATION=0 RCT_SKIP_CODEGEN=0 EXPO_USE_PRECOMPILED_MODULES=0 \
+    UC_ENGINE_UNIFFI_SLICE=device UC_ENGINE_LOCAL_CORE=1 APP_VARIANT=development \
+    npx expo run:ios --device "$device" --no-bundler
+  restore_pinned_ios_engine
+  trap - EXIT
+}
+
+# Install a signed release variant, then restore the development project and Engine mode.
+install_ios_release() {
+  local device="$1"
+  local variant="$2"
+  local bindings_cache="${UC_ENGINE_STORAGE_BUILD_DIR:-$LOCAL_ENGINE_BUILD_ROOT}/ios-bindings-cache"
+  local derived_data="$PROJECT_ROOT/ios/build/$variant-device"
+  local identity
+  local bundle_id
+  local display_name
+  local project_name
+  identity="$(ios_release_identity "$variant")"
+  IFS='|' read -r bundle_id display_name project_name <<< "$identity"
+  local app_path="$derived_data/Build/Products/Release-iphoneos/$project_name.app"
+  local info_plist="$app_path/Info.plist"
+
+  require_command codesign
+  require_command xcodebuild
+
+  restore_pinned_ios_engine
+  trap 'status=$?; if restore_development_ios_project; then restore_status=0; else restore_status=$?; fi; if [ "$status" -eq 0 ] && [ "$restore_status" -ne 0 ]; then status="$restore_status"; fi; exit "$status"' EXIT
+  APP_VARIANT="$variant" npx expo prebuild --platform ios --no-install
+  RCT_IGNORE_PODS_DEPRECATION=0 RCT_SKIP_CODEGEN=0 EXPO_USE_PRECOMPILED_MODULES=0 \
+    UC_ENGINE_LOCAL_CORE=1 npx pod-install ios
+  assert_release_ios_project "$variant" "$bundle_id" "$project_name"
+  UC_ENGINE_UNIFFI_SLICE=device \
+    UC_ENGINE_UNIFFI_BINDINGS_CACHE_DIR="$bindings_cache" \
+    prepare_install_engine ios
+  APP_VARIANT="$variant" UC_ENGINE_LOCAL_CORE=1 UC_ENGINE_UNIFFI_SLICE=device \
+    xcodebuild \
+      -workspace "$PROJECT_ROOT/ios/$project_name.xcworkspace" \
+      -scheme "$project_name" \
+      -configuration Release \
+      -destination 'generic/platform=iOS' \
+      -derivedDataPath "$derived_data" \
+      -allowProvisioningUpdates \
+      build
+  if [ ! -d "$app_path" ]; then
+    echo "The iOS $variant app was not produced: $app_path" >&2
+    exit 1
+  fi
+  if [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")" != "$bundle_id" ]; then
+    echo "The built iOS app does not have the $variant bundle identifier." >&2
+    exit 1
+  fi
+  if [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$info_plist")" != "$display_name" ]; then
+    echo "The built iOS app does not have the $variant display name." >&2
+    exit 1
+  fi
+  codesign --verify --deep --strict "$app_path"
+  xcrun devicectl device install app --device "$device" "$app_path"
+  xcrun devicectl device process launch --device "$device" "$bundle_id"
+  restore_development_ios_project
+  trap - EXIT
+}
+
+install_android() {
+  local device="$1"
+  local apk_path="$PROJECT_ROOT/android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk"
+  local engine_aar="$LOCAL_ENGINE_BUILD_ROOT/uc-engine-uniffi-dist/android/UniClipboardEngine.aar"
+  require_command adb
+
+  if [ "$(adb -s "$device" get-state 2>/dev/null || true)" != "device" ]; then
+    echo "Android device is not available: $device" >&2
+    echo "Connect and unlock the phone, enable USB debugging, then try again." >&2
+    exit 1
+  fi
+
+  case "$ANDROID_INSTALL_VARIANT" in
+    production|test)
+      install_android_release "$device" "$ANDROID_INSTALL_VARIANT"
+      return
+      ;;
+    development) ;;
+    *)
+      echo "Unsupported Android install variant: $ANDROID_INSTALL_VARIANT" >&2
+      exit 2
+      ;;
+  esac
+
+  assert_development_project android
+  prepare_install_engine android
+  if [ ! -f "$engine_aar" ]; then
+    echo "The local Android engine is missing: $engine_aar" >&2
+    echo "Prepare the local Android engine before installing." >&2
+    exit 1
+  fi
+  (cd "$PROJECT_ROOT/android" && UC_ENGINE_LOCAL_AAR="$engine_aar" ./gradlew :app:assembleDebug)
+  if [ ! -f "$apk_path" ]; then
+    echo "Android development app was not produced: $apk_path" >&2
+    exit 1
+  fi
+  adb -s "$device" install -r "$apk_path"
+  adb -s "$device" reverse tcp:8081 tcp:8081
+  adb -s "$device" shell monkey -p app.unoscil.android.dev 1 >/dev/null
+}
+
+# Installs the test APK over adb, or copies it to Download/UnoscilRelease on the
+# phone when the system rejects USB installs, so it can be installed by hand.
+deliver_android_test_apk() {
+  local device="$1"
+  local apk_path="$2"
+  local application_id="$3"
+  local remote_dir="/sdcard/Download/UnoscilRelease"
+  local remote_apk="$remote_dir/Unoscil-Test.apk"
+
+  if adb -s "$device" install -r "$apk_path"; then
+    adb -s "$device" shell monkey -p "$application_id" 1 >/dev/null
+    return
+  fi
+  echo "adb could not install the test app; copying it to the phone instead." >&2
+  adb -s "$device" shell mkdir -p "$remote_dir"
+  adb -s "$device" push "$apk_path" "$remote_apk"
+  # File managers list Download through MediaStore; index the copy right away.
+  adb -s "$device" shell content call --uri content://media/external/file \
+    --method scan_volume --arg external_primary >/dev/null
+  echo "Install it on the phone from Download/UnoscilRelease/Unoscil-Test.apk."
+}
+
+install_android_release() {
+  local device="$1"
+  local variant="$2"
+  local apk_path="$PROJECT_ROOT/android/app/build/outputs/apk/release/app-arm64-v8a-release.apk"
+  local engine_aar="$LOCAL_ENGINE_BUILD_ROOT/uc-engine-uniffi-dist/android/UniClipboardEngine.aar"
+  local application_id
+  application_id="$(android_release_identity "$variant")"
+
+  require_command apkanalyzer
+  trap 'status=$?; if restore_development_android_project; then restore_status=0; else restore_status=$?; fi; if [ "$status" -eq 0 ] && [ "$restore_status" -ne 0 ]; then status="$restore_status"; fi; exit "$status"' EXIT
+  APP_VARIANT="$variant" npx expo prebuild --platform android --no-install
+  assert_release_android_project "$variant" "$application_id"
+  prepare_install_engine android
+  if [ ! -f "$engine_aar" ]; then
+    echo "The local Android engine is missing: $engine_aar" >&2
+    exit 1
+  fi
+  (cd "$PROJECT_ROOT/android" && UC_ENGINE_LOCAL_AAR="$engine_aar" ./gradlew :app:assembleRelease)
+  if [ ! -f "$apk_path" ]; then
+    echo "Android $variant app was not produced: $apk_path" >&2
+    exit 1
+  fi
+  if [ "$(apkanalyzer manifest application-id "$apk_path")" != "$application_id" ]; then
+    echo "The built Android app does not have the $variant application identifier." >&2
+    exit 1
+  fi
+  if [ "$variant" = "test" ]; then
+    deliver_android_test_apk "$device" "$apk_path" "$application_id"
+  else
+    adb -s "$device" install -r "$apk_path"
+    adb -s "$device" shell monkey -p "$application_id" 1 >/dev/null
+  fi
+  restore_development_android_project
+  trap - EXIT
+}
+
+platform="${1:-all}"
+device="${2:-}"
+
+if [ "$#" -gt 2 ]; then
+  usage >&2
+  exit 2
+fi
+
+if [ "$device" = "--help" ] || [ "$device" = "-h" ]; then
+  usage
+  exit 0
+fi
+
+if [ "$platform" = "--help" ] || [ "$platform" = "-h" ]; then
+  usage
+  exit 0
+fi
+
+uc_engine_build_storage_enter "$PROJECT_ROOT" "${BASH_SOURCE[0]}" "$@"
+LOCAL_ENGINE_BUILD_ROOT="$(uc_engine_build_target "$ENGINE_ROOT")"
+export PROJECT_ROOT SCRIPT_DIR LOCAL_ENGINE_BUILD_ROOT
+
+case "$platform" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  ios)
+    install_ios "${device:-$DEFAULT_IOS_DEVICE}"
+    ;;
+  android)
+    install_android "${device:-$DEFAULT_ANDROID_DEVICE}"
+    ;;
+  all)
+    if [ -n "$device" ]; then
+      echo "A device override is only supported when installing one platform." >&2
+      exit 2
+    fi
+    install_ios "$DEFAULT_IOS_DEVICE"
+    install_android "$DEFAULT_ANDROID_DEVICE"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

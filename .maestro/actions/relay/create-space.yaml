@@ -1,0 +1,73 @@
+appId: ${APP_ID}
+---
+- runFlow: ../devices/open.yaml
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: sync-channel-p2p
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "Direct device sync.*"
+- runFlow:
+    when:
+      visible: "Use direct device sync?"
+    commands:
+      - tapOn: "Use direct sync"
+- extendedWaitUntil:
+    visible: "Create a new space"
+    timeout: 30000
+- tapOn: "Create a new space"
+- tapOn: "Space password"
+- inputText: RelayE2E-passphrase
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - hideKeyboard
+- tapOn: "Create"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - extendedWaitUntil:
+          visible: "Save Password?"
+          timeout: 30000
+      - tapOn: "Not Now"
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - extendedWaitUntil:
+          visible:
+            id: space-finish-later
+          timeout: 30000
+      - tapOn:
+          id: space-finish-later
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - extendedWaitUntil:
+          visible: "Finish later"
+          timeout: 30000
+      - tapOn: "Finish later"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - extendedWaitUntil:
+          visible:
+            id: space-settings
+          timeout: 30000
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - extendedWaitUntil:
+          visible: "Custom relay"
+          timeout: 30000
+- waitForAnimationToEnd

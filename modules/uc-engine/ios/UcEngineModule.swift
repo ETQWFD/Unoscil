@@ -1,0 +1,1377 @@
+import ExpoModulesCore
+import Foundation
+import OSLog
+import UIKit
+internal import UcEngineCore
+
+public final class UcEngineModule: Module {
+  private static let spaceReadLog = Logger(subsystem: "app.unoscil", category: "space-read")
+  private static let startupLog = Logger(subsystem: "app.unoscil", category: "uc-startup")
+  private let host = MainApplicationEngineHost()
+  private lazy var lifecycle = NativeLifecycleHost(
+    report: Self.reportLifecycleError,
+    flushObservability: { _ = try? flushProcessObservability(deadlineMs: 250) },
+    releaseObservability: AppleProcessObservability.suspend,
+    resumeObservability: { [host] in
+      try host.prepareDiagnosticLogging()
+      try AppleProcessObservability.resume()
+      AppleNativeDiagnostics.journal.resume()
+    }
+  )
+  private lazy var hostSuspension = NativeHostSuspension { [weak self] phase, transitionId in
+    self?.sendEvent(Self.hostSuspensionEvent, ["phase": phase, "transitionId": transitionId])
+  }
+  private lazy var lifecycleTransitions = NativeLifecycleTransitionCoordinator(
+    lifecycle: lifecycle,
+    queue: DispatchQueue(label: "app.unoscil.engine-lifecycle"),
+    beginBackgroundActivity: Self.beginBackgroundActivity,
+    hostSuspension: hostSuspension,
+    reportBackground: AppleNativeDiagnostics.recordBackgroundTransition
+  )
+  private static let hostSuspensionEvent = "onHostSuspension"
+  private var resignActiveObserver: NSObjectProtocol?
+  private let engineOperationQueue = DispatchQueue(label: "app.unoscil.uc-engine")
+  private let engineConnectivityQueue = DispatchQueue(label: "app.unoscil.uc-engine-connectivity")
+  private let engineEventQueue = DispatchQueue(label: "app.unoscil.uc-engine-events")
+  private let engines = NativeEngineRegistry<MobileEngine>()
+  private let startupLifecycles = NativeEngineRegistry<MobileStartupLifecycle>()
+  private let lifecycleOwnerLock = NSLock()
+  /// The one `AppleEngineLifecycle` (and the `RuntimeOwnedNativeLifecycle` it
+  /// wraps) for the currently active engine, reused across every
+  /// suspend/resume/background/foreground call. Keyed by the engine's
+  /// identity so a replaced engine gets a fresh owner automatically.
+  ///
+  /// Constructing a fresh owner per call (the previous shape here, CodeRabbit
+  /// review on PR #60) silently defeats the confirmation-watcher: nothing
+  /// else retains the owner once the call that created it returns without
+  /// calling `finish()` (the deadline-exceeded failure path), so
+  /// `watchForConfirmedSuspension`'s `[weak self]` capture is already nil by
+  /// the time it fires -- the ownership flock then never gets released, even
+  /// on a single transition with no race involved. Proved with the real
+  /// classes and a real separate-process flock probe in
+  /// `library/evidence/cross-process-flock-harness` Scenario D.
+  private var cachedLifecycleOwner: (engineId: ObjectIdentifier, owner: AppleEngineLifecycle)?
+
+  private func activeLifecycleOwner(for engine: MobileEngine) -> AppleEngineLifecycle {
+    lifecycleOwnerLock.withLock {
+      let id = ObjectIdentifier(engine)
+      if let cached = cachedLifecycleOwner, cached.engineId == id {
+        return cached.owner
+      }
+      let owner = AppleEngineLifecycle(engine: engine, host: host)
+      cachedLifecycleOwner = (id, owner)
+      return owner
+    }
+  }
+
+  public func definition() -> ModuleDefinition {
+    Name("UcEngine")
+    OnCreate {
+      self.lifecycle.setForegroundAdmission(UIApplication.shared.applicationState != .background)
+      AppleNativeDiagnostics.start()
+      self.engineOperationQueue.async {
+        self.lifecycle.performForegroundWork { try? self.host.prepareDiagnosticLogging() }
+      }
+      // Expo has no resign-active hook; it fires before didEnterBackground.
+      self.resignActiveObserver = NotificationCenter.default.addObserver(
+        forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+      ) { [weak self] _ in self?.lifecycleTransitions.prepareForBackground() }
+    }
+    OnDestroy {
+      self.resignActiveObserver.map(NotificationCenter.default.removeObserver)
+    }
+
+    Events(Self.hostSuspensionEvent)
+    OnStartObserving(Self.hostSuspensionEvent) { self.hostSuspension.setParticipating(true) }
+    OnStopObserving(Self.hostSuspensionEvent) { self.hostSuspension.setParticipating(false) }
+    AsyncFunction("completeHostSuspension") { (transitionId: Int, released: Bool) in
+      AppleNativeDiagnostics.journal.record(
+        .hostSuspend, trigger: .appBackground, outcome: released ? .succeeded : .failed
+      )
+      self.hostSuspension.complete(transitionId: transitionId, released: released)
+    }
+
+    Function("coreVersion") { coreVersion() }
+
+    AsyncFunction("queryRejectedConfigImport") {
+      try Self.engineResult {
+        guard let rejected = try self.requireEngine().queryRejectedConfigImport() else {
+          return ["rejection": NSNull()]
+        }
+        let reason: String
+        switch rejected.reason {
+        case .unsupportedFormat: reason = "unsupportedFormat"
+        case .malformedMarker: reason = "malformedMarker"
+        case .missingRuntimeMembers: reason = "missingRuntimeMembers"
+        }
+        return ["rejection": ["reason": reason, "message": rejected.message]]
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("startEngineDiagnosticCapture") { (durationMs: UInt64) in
+      try self.host.prepareDiagnosticLogging()
+      return EngineDiagnosticBridge.map(try startLocalDiagnosticCapture(durationMs: durationMs))
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("stopEngineDiagnosticCapture") { (captureId: String) in
+      String(describing: try stopLocalDiagnosticCapture(captureId: captureId))
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("getEngineDiagnosticStatus") {
+      try self.host.prepareDiagnosticLogging()
+      return EngineDiagnosticBridge.map(try queryLocalDiagnosticStatus())
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("prepareEngineDiagnosticExport") {
+      try self.host.prepareDiagnosticLogging()
+      return EngineDiagnosticBridge.map(try prepareLocalDiagnosticExport(deadlineMs: 1_000))
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("flushEngineLogs") { () -> Bool in
+      let summary = try flushProcessObservability(deadlineMs: 1_000)
+      return summary.logs == .completed
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("getNativeDiagnostics") { AppleNativeDiagnostics.exportSnapshot() }
+      .runOnQueue(engineOperationQueue)
+
+    AsyncFunction("getEngineLogStatus") { self.host.getEngineLogStatus() }
+      .runOnQueue(engineOperationQueue)
+
+    // The network-library log is a separate source with its own state; none of these calls
+    // depend on, or change, the business log. They run on the Engine queue, never the UI thread.
+    AsyncFunction("getNetworkLogStatus") { () -> [String: Any] in
+      try? self.host.prepareDiagnosticLogging()
+      return NetworkLogHost.status()
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("startNetworkLogCapture") { (durationMs: Double) -> [String: Any] in
+      guard durationMs.isFinite, durationMs >= 0, durationMs <= Double(UInt64.max) else {
+        return ["ok": false, "error": "invalidDuration"]
+      }
+      try? self.host.prepareDiagnosticLogging()
+      return NetworkLogHost.startCapture(durationMs: UInt64(durationMs))
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("stopNetworkLogCapture") { (captureId: String) -> [String: Any] in
+      NetworkLogHost.stopCapture(captureId: captureId)
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("prepareNetworkLogExport") { () -> [String: Any] in
+      try? self.host.prepareDiagnosticLogging()
+      return NetworkLogHost.prepareExport(
+        deadlineMs: 1_000, stagingRoot: NetworkLogHost.defaultStagingRoot, fallbackRoot: NetworkLogHost.appGroupNetworkRoot()
+      )
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("releaseNetworkLogExport") { (exportId: String) in
+      NetworkLogHost.releaseExport(exportId: exportId, stagingRoot: NetworkLogHost.defaultStagingRoot)
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("start") { (config: [String: String]) in
+      let startedAt = ProcessInfo.processInfo.systemUptime
+      let appVersion = config["appVersion"] ?? "unknown"
+      let profileId = config["profileId"] ?? "default"
+      Self.startupLog.info("Native module start requested")
+      let startupLifecycle = MobileStartupLifecycle()
+      guard self.startupLifecycles.installBeforePreparing(startupLifecycle, prepare: { _ in }) else {
+        throw UcEngineAlreadyStartedException()
+      }
+      defer { _ = self.startupLifecycles.take() }
+      let started = try self.host.start(
+        appVersion: appVersion,
+        profileId: profileId,
+        lifecycle: startupLifecycle
+      )
+      Self.startupLog.info(
+        "Engine host started in \(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1_000))ms"
+      )
+      do {
+        let installed = try self.engines.installBeforePreparing(started) { engine in
+          let recoveryStartedAt = ProcessInfo.processInfo.systemUptime
+          Self.startupLog.info("Recovering persisted session")
+          try self.lifecycle.prepare(AppleEngineLifecycle(engine: engine, host: self.host))
+          self.host.refreshAnalyticsContext(engine: engine)
+          Self.startupLog.info(
+            "Persisted session recovered in \(Int((ProcessInfo.processInfo.systemUptime - recoveryStartedAt) * 1_000))ms"
+          )
+        }
+        guard installed else {
+          throw UcEngineAlreadyStartedException()
+        }
+        Self.startupLog.info(
+          "Native module ready in \(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1_000))ms"
+        )
+      } catch {
+        Self.startupLog.error("Native module start failed: \(String(describing: error))")
+        do {
+          try started.shutdown(deadlineMs: 2_000)
+        } catch {
+          Self.reportLifecycleError(error)
+        }
+        if self.currentEngine() == nil {
+          self.host.releaseRuntimeOwnership()
+        }
+        throw error
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("shutdown") { (deadlineMs: UInt64) in
+      let active = self.engines.current()
+      try AppleNativeDiagnostics.observe(.engineShutdown, trigger: .userRequest) {
+        try active?.shutdown(deadlineMs: deadlineMs)
+      }
+      _ = self.engines.take()
+      self.host.releaseRuntimeOwnership()
+      self.host.removeAllFileHandles()
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("shutdownUntilComplete") {
+      let active = self.engines.current()
+      try AppleNativeDiagnostics.observe(.engineShutdown, trigger: .userRequest) {
+        try Self.shutdownCompletely(active)
+      }
+      _ = self.engines.take()
+      self.host.releaseRuntimeOwnership()
+      self.host.removeAllFileHandles()
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("suspend") {
+      try self.lifecycle.suspendIfNeeded(
+        self.activeLifecycleOwner(for: self.requireEngine()),
+        remainingTimeMs: { nil }
+      )
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("resume") {
+      try self.lifecycle.resumeIfNeeded(
+        self.activeLifecycleOwner(for: self.requireEngine())
+      )
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("setBackgroundSyncEnabled") { (_: Bool, _: Bool) in }
+      .runOnQueue(engineOperationQueue)
+
+    AsyncFunction("getAnalyticsConsent") { try self.host.analyticsConsentEnabled() }
+      .runOnQueue(engineOperationQueue)
+    AsyncFunction("getAnalyticsState") { try self.host.getAnalyticsState() }
+      .runOnQueue(engineOperationQueue)
+    AsyncFunction("setAnalyticsConsent") { (enabled: Bool) in
+      try self.host.setAnalyticsConsentEnabled(enabled)
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("resetAnalyticsIdentity") { try self.host.resetAnalyticsIdentity() }
+      .runOnQueue(engineOperationQueue)
+
+    AsyncFunction("createSpace") { (deviceName: String?, passphrase: String) -> [String: Any] in
+      return try Self.engineResult { () throws -> [String: Any] in
+        let engine = try self.requireEngine()
+        let result = try engine.createSpace(
+          deviceName: deviceName,
+          passphrase: passphrase
+        )
+        self.host.refreshAnalyticsContext(engine: engine)
+        return [
+          "spaceId": result.spaceId,
+          "selfDeviceId": result.selfDeviceId,
+          "identityFingerprint": result.identityFingerprint,
+        ]
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("issueInvitation") { () -> [String: Any] in
+      return try Self.engineResult { () throws -> [String: Any] in
+        let result = try self.requireEngine().issueInvitation()
+        let availability = switch result.availability {
+        case .crossNetwork: "crossNetwork"
+        case .sameLocalNetwork: "sameLocalNetwork"
+        }
+        return [
+          "invitationCode": result.invitationCode,
+          "fullInvitation": result.fullInvitation,
+          "expiresAtMs": result.expiresAtMs,
+          "availability": availability,
+        ]
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("joinSpace") {
+      (
+        invitationCode: String,
+        deviceName: String?,
+        passphrase: String,
+        preserveUnreadableHistory: Bool
+      ) -> [String: Any] in
+      return try Self.engineResult { () throws -> [String: Any] in
+        let engine = try self.requireEngine()
+        let result = try engine.joinSpace(
+          invitationCode: invitationCode,
+          deviceName: deviceName,
+          passphrase: passphrase,
+          preserveUnreadableHistory: preserveUnreadableHistory
+        )
+        self.host.refreshAnalyticsContext(engine: engine)
+        switch result {
+        case let .active(joinId, joinedSpace, peerUpgradeRequired):
+          return [
+            "type": "active",
+            "peerUpgradeRequired": peerUpgradeRequired,
+            "joinId": joinId,
+            "joinedSpace": [
+              "sponsorDeviceId": joinedSpace.sponsorDeviceId,
+              "sponsorIdentityFingerprint": joinedSpace.sponsorIdentityFingerprint,
+              "spaceId": joinedSpace.spaceId,
+              "selfDeviceId": joinedSpace.selfDeviceId,
+              "selfIdentityFingerprint": joinedSpace.selfIdentityFingerprint,
+              "migratedRecords": joinedSpace.migratedRecords ?? 0,
+              "preservedUnreadableRecords": joinedSpace.preservedUnreadableRecords ?? 0,
+            ],
+          ]
+        case let .pending(joinId, targetSpaceId, sponsorDeviceId, sponsorIdentityFingerprint, cancelRequested, peerUpgradeRequired):
+          return [
+            "type": "pending",
+            "peerUpgradeRequired": peerUpgradeRequired,
+            "joinId": joinId,
+            "targetSpaceId": targetSpaceId as Any,
+            "sponsorDeviceId": sponsorDeviceId as Any,
+            "sponsorIdentityFingerprint": sponsorIdentityFingerprint as Any,
+            "cancelRequested": cancelRequested,
+          ]
+        case let .processing(joinId, targetSpaceId, sponsorDeviceId, sponsorIdentityFingerprint, peerUpgradeRequired):
+          return [
+            "type": "processing",
+            "joinId": joinId,
+            "targetSpaceId": targetSpaceId,
+            "sponsorDeviceId": sponsorDeviceId,
+            "sponsorIdentityFingerprint": sponsorIdentityFingerprint,
+            "peerUpgradeRequired": peerUpgradeRequired,
+          ]
+        case let .needsAttention(joinId, reason, recovery, nextRetryAtMs):
+          let attentionReason = switch reason {
+          case .outcomeCannotBeProven: "outcomeCannotBeProven"
+          case .continuationUnavailable: "continuationUnavailable"
+          }
+          let attentionRecovery = switch recovery {
+          case .preserveDataAndContactSupport: "preserveDataAndContactSupport"
+          case .restartWithNewInvitation: "restartWithNewInvitation"
+          }
+          return [
+            "type": "needsAttention",
+            "joinId": joinId,
+            "reason": attentionReason,
+            "recovery": attentionRecovery,
+            "nextRetryAtMs": nextRetryAtMs as Any,
+          ]
+        case let .rejected(joinId, reason):
+          let rejectionReason = switch reason {
+          case .invitationUnavailable: "invitationUnavailable"
+          case .authenticationRejected: "authenticationRejected"
+          case .identityConflict: "identityConflict"
+          case .baseHistoryChanged: "baseHistoryChanged"
+          case .joinerHistoryAhead: "joinerHistoryAhead"
+          case .historyConflict: "historyConflict"
+          case .completionInvalid: "completionInvalid"
+          case .membershipHistoryInvalid: "membershipHistoryInvalid"
+          case .securityMaterialInvalid: "securityMaterialInvalid"
+          case .relationshipConflict: "relationshipConflict"
+          case .activationStateInvalid: "activationStateInvalid"
+          case .peerUpgradeRequired: "peerUpgradeRequired"
+          case .sponsorUnresponsive: "sponsorUnresponsive"
+          case .cancelled: "cancelled"
+          case .removedBeforeActivation: "removedBeforeActivation"
+          }
+          return ["type": "rejected", "joinId": joinId, "reason": rejectionReason]
+        case let .terminated(joinId, reason):
+          let terminationReason = switch reason {
+          case .cancelled: "cancelled"
+          case .expired: "expired"
+          case .superseded: "superseded"
+          }
+          return ["type": "terminated", "joinId": joinId, "reason": terminationReason]
+        }
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("cancelJoinSpace") { (joinId: String) in
+      _ = try self.requireEngine().cancelJoinSpace(joinId: joinId)
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("nextEvent") { (timeoutMs: UInt64) -> [String: Any?]? in
+      guard let event = try self.requireEngine().nextEvent(timeoutMs: timeoutMs) else { return nil }
+      var mapped = Self.eventMap(event)
+      mapped["diagnosticNativeReturnedAtMs"] = Date().timeIntervalSince1970 * 1_000
+      mapped["diagnosticNativeUptimeMs"] = ProcessInfo.processInfo.systemUptime * 1_000
+      return mapped
+    }.runOnQueue(engineEventQueue)
+
+    AsyncFunction("notifyConnectivityOpportunity") { (reason: String) in
+      let opportunity: ConnectivityOpportunity
+      switch reason {
+      case "foreground": opportunity = .foreground
+      case "system_wake": opportunity = .systemWake
+      case "network_changed": opportunity = .networkChanged
+      default: throw UcEngineInvalidConnectivityOpportunityException()
+      }
+      try self.requireEngine().notifyConnectivityOpportunity(reason: opportunity)
+    }.runOnQueue(engineConnectivityQueue)
+    AsyncFunction("refreshPeerConnections") { () -> [String: Any] in
+      let result = try self.requireEngine().refreshPeerConnections()
+      return [
+        "total": result.total,
+        "online": result.online,
+        "offline": result.offline,
+        "errors": result.errors,
+      ]
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("saveCustomRelayNode") {
+      (url: String, accessToken: String, previousUrl: String?) -> [String: Any] in
+      let result = try self.requireEngine().saveCustomRelay(
+        url: url,
+        accessToken: accessToken,
+        previousUrl: previousUrl
+      )
+      return ["configured": result.configured]
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("queryCustomRelays") { () -> [[String: Any]] in
+      try self.requireEngine().queryCustomRelays().map(Self.customRelayDictionary)
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("queryRelayOverview") { () -> [String: Any] in
+      Self.relayOverviewDictionary(try self.requireEngine().queryRelayOverview())
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("addCustomRelay") { (url: String, accessToken: String) -> [String: Any] in
+      Self.customRelayMutationDictionary(
+        try self.requireEngine().addCustomRelay(url: url, accessToken: accessToken)
+      )
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("editCustomRelay") {
+      (previousUrl: String, url: String, accessToken: String) -> [String: Any] in
+      Self.customRelayMutationDictionary(
+        try self.requireEngine().editCustomRelay(
+          previousUrl: previousUrl, url: url, accessToken: accessToken
+        )
+      )
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("deleteCustomRelay") { (url: String) -> [String: Any] in
+      Self.customRelayMutationDictionary(try self.requireEngine().deleteCustomRelay(url: url))
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("querySpaceState") { () -> [String: Any?] in
+      let result = try self.runSpaceRead("querySpaceState") {
+        try self.requireEngine().querySpaceState()
+      }
+      Self.spaceReadLog.info(
+        "space_read operation=querySpaceState outcome=success hasCompleted=\(result.hasCompleted, privacy: .public) hasSpace=\(result.spaceId != nil, privacy: .public) hasInvitation=\(result.currentInvitation != nil, privacy: .public)"
+      )
+      return [
+        "hasCompleted": result.hasCompleted,
+        "rePairingRequired": result.rePairingRequired,
+        "spaceId": result.spaceId,
+        "currentInvitation": result.currentInvitation.map {
+          ["invitationCode": $0.invitationCode, "fullInvitation": $0.fullInvitation, "expiresAtMs": $0.expiresAtMs]
+        },
+        "deviceName": result.deviceName,
+      ]
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("listDevices") { () -> [[String: Any]] in
+      let engine = try self.requireEngine()
+      let devices = try self.runSpaceRead("listDevices") {
+        self.host.refreshAnalyticsContext(engine: engine)
+        let localDeviceId = try engine.queryLocalDevice().deviceId
+        return try engine.listDevices().map {
+          [
+            "deviceId": $0.deviceId,
+            "displayName": $0.displayName,
+            "isLocal": $0.deviceId == localDeviceId,
+            "online": $0.online,
+          ]
+        }
+      }
+      Self.spaceReadLog.info(
+        "space_read operation=listDevices outcome=success deviceCount=\(devices.count, privacy: .public)"
+      )
+      return devices
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("queryDeviceGroupChoices") { () -> [String: Any] in
+      do {
+        return [
+          "ok": true,
+          "value": try self.runSpaceRead("queryDeviceGroupChoices") {
+            try self.requireEngine().queryDeviceGroupChoices()
+          },
+        ]
+      } catch let bindingError as BindingError {
+        if case let .Engine(code, category, retryable) = bindingError {
+          return [
+            "ok": false,
+            "failure": Self.engineFailureMap(
+              code: code,
+              category: category,
+              retryable: retryable
+            ),
+          ]
+        }
+        throw bindingError
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("chooseDeviceGroup") {
+      (issueId: String, choiceId: String, expectedRevision: UInt64, confirmLocalRemoval: Bool) -> String in
+      try self.requireEngine().chooseDeviceGroup(
+        issueId: issueId,
+        choiceId: choiceId,
+        expectedRevision: expectedRevision,
+        confirmLocalRemoval: confirmLocalRemoval
+      )
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("removeMember") { (deviceId: String) -> [String: Any?] in
+      let engine = try self.requireEngine()
+      let result = try engine.removeMember(deviceId: deviceId)
+      self.host.refreshAnalyticsContext(engine: engine)
+      return Self.workspaceConvergenceMap(result)
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("resendEntry") {
+      (entryId: String, targetDevices: [String], confirmNewTransfer: Bool) -> [String: Any] in
+      try Self.engineResult {
+        Self.resendOutcomeMap(
+          try self.requireEngine().resendEntry(entryId: entryId, targetDevices: targetDevices, confirmNewTransfer: confirmNewTransfer)
+        )
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("leaveSpace") {
+      let engine = try self.requireEngine()
+      try engine.leaveSpace()
+      self.host.refreshAnalyticsContext(engine: engine)
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("sendText") { (text: String, targetDevices: [String]) -> [String: Any] in
+      Self.sendReportMap(
+        try self.requireEngine().sendText(text: text, targetDevices: targetDevices)
+      )
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("sendImage") {
+      (bytes: Data, mimeType: String, targetDevices: [String]) -> [String: Any] in
+      Self.sendReportMap(
+        try self.requireEngine().sendImage(
+          bytes: bytes,
+          mimeType: mimeType,
+          targetDevices: targetDevices
+        )
+      )
+    }.runOnQueue(engineOperationQueue)
+
+    Function("registerInputFile") { (uri: String, displayName: String?) in
+      try self.host.registerInputFile(uri: uri, displayName: displayName)
+    }
+    Function("registerOutputFile") { (uri: String) in
+      try self.host.registerOutputFile(uri: uri)
+    }
+    Function("releaseFileHandle") { (handle: String) in self.host.releaseFileHandle(handle) }
+
+    AsyncFunction("sendFiles") {
+      (fileHandles: [String], targetDevices: [String]) -> [String: Any] in
+      Self.sendReportMap(
+        try self.requireEngine().sendFiles(
+          fileHandles: fileHandles,
+          targetDevices: targetDevices
+        )
+      )
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("captureCurrentClipboard") { () -> String? in
+      try self.requireEngine().captureCurrentClipboard()
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("observeClipboardChange") { (dispatch: Bool) -> [String: Any]? in
+      try self.requireEngine().observeClipboardChange(dispatch: dispatch).map(Self.sendReportMap)
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("restoreClipboard") { (entryId: String, mode: String) -> String in
+      let result = try self.requireEngine().restoreClipboard(
+        entryId: entryId,
+        mode: Self.restoreMode(mode)
+      )
+      return Self.restoreOutcome(result)
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("exportEntry") { (entryId: String, destinationHandle: String) in
+      try self.requireEngine().exportEntry(
+        entryId: entryId,
+        destinationHandle: destinationHandle
+      )
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("queryOutboundProgress") { (entryId: String, targetDeviceId: String) -> [String: Any] in
+      try Self.engineResult {
+        ["progress": try self.requireEngine().queryOutboundProgress(entryId: entryId, targetDeviceId: targetDeviceId).map(Self.outboundProgressMap) ?? NSNull()]
+      }
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("listOutboundProgress") { () -> [String: Any] in
+      try Self.engineResult {
+        ["progress": try self.requireEngine().listOutboundProgress().map(Self.outboundProgressMap)]
+      }
+    }.runOnQueue(engineOperationQueue)
+    AsyncFunction("reconcileOutboundProgress") { (entryId: String, targetDeviceId: String, expectedAttemptId: String?) -> [String: Any] in
+      try Self.engineResult {
+        ["state": try self.requireEngine().reconcileOutboundProgress(entryId: entryId, targetDeviceId: targetDeviceId, expectedAttemptId: expectedAttemptId)]
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("queryEntryReceiveProgress") { (entryId: String) -> [String: Any]? in
+      try self.requireEngine().queryEntryReceiveProgress(entryId: entryId)
+        .map(Self.receiveProgressMap)
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("listEntryReceiveProgress") { () -> [[String: Any]] in
+      try self.requireEngine().listEntryReceiveProgress().map(Self.receiveProgressMap)
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("retryEntryReceive") {
+      (entryId: String, expectedAttemptId: String, itemIds: [String]) -> [String: Any] in
+      try Self.engineResult {
+        let engine = try self.requireEngine()
+        let outcome = try engine.retryEntryReceive(entryId: entryId, expectedAttemptId: expectedAttemptId, itemIds: itemIds)
+        return Self.receiveRetryOutcomeMap(outcome)
+      }
+    }.runOnQueue(engineOperationQueue)
+
+    AsyncFunction("cancelEntryReceive") { (entryId: String, attemptId: String) -> String in
+      try self.requireEngine().cancelEntryReceive(entryId: entryId, attemptId: attemptId)
+    }.runOnQueue(engineOperationQueue)
+
+    OnAppEntersBackground {
+      EngineDiagnosticBridge.record(.lifecycle(state: .background))
+      AppleNativeDiagnostics.journal.record(.appBackground, trigger: .appBackground)
+      self.lifecycleTransitions.enterBackground(
+        self.currentLifecycle()
+      )
+    }
+    OnAppEntersForeground {
+      AppleNativeDiagnostics.journal.resume()
+      EngineDiagnosticBridge.record(.lifecycle(state: .foreground))
+      AppleNativeDiagnostics.journal.record(.appForeground, trigger: .appForeground)
+      self.lifecycleTransitions.enterForeground(
+        self.currentLifecycle()
+      )
+    }
+    OnAppBecomesActive { self.lifecycleTransitions.cancelBackgroundPreparation() }
+    OnAppContextDestroys { self.shutdownForDestroy() }
+  }
+
+  private func currentEngine() -> MobileEngine? {
+    engines.current()
+  }
+
+  private func currentLifecycle() -> (any NativeEngineLifecycle)? {
+    if let engine = currentEngine() {
+      return activeLifecycleOwner(for: engine)
+    }
+    lifecycleOwnerLock.withLock { cachedLifecycleOwner = nil }
+    return startupLifecycles.current().map(AppleStartupLifecycle.init)
+  }
+
+  private func requireEngine() throws -> MobileEngine {
+    guard let active = currentEngine() else { throw UcEngineNotStartedException() }
+    return active
+  }
+
+  private func runSpaceRead<T>(_ operation: String, read: () throws -> T) throws -> T {
+    do {
+      return try read()
+    } catch {
+      Self.reportSpaceReadError(operation, error: error)
+      throw error
+    }
+  }
+
+  private static func reportSpaceReadError(_ operation: String, error: Error) {
+    if let bindingError = error as? BindingError,
+       case let .Engine(code, category, retryable) = bindingError {
+      spaceReadLog.error(
+        "space_read operation=\(operation, privacy: .public) outcome=failure errorKind=engine errorCode=\(code, privacy: .public) errorCategory=\(String(describing: category), privacy: .public) retryable=\(retryable, privacy: .public)"
+      )
+      return
+    }
+    spaceReadLog.error(
+      "space_read operation=\(operation, privacy: .public) outcome=failure errorKind=\(String(describing: type(of: error)), privacy: .public)"
+    )
+  }
+
+  private func shutdownForDestroy() {
+    let active = engines.current()
+    do {
+      try AppleNativeDiagnostics.observe(.engineShutdown, trigger: .contextDestroyed) {
+        try Self.shutdownCompletely(active)
+      }
+      _ = engines.take()
+      host.releaseRuntimeOwnership()
+    } catch {
+      Self.reportLifecycleError(error)
+    }
+    host.removeAllFileHandles()
+    _ = AppleNativeDiagnostics.journal.flush()
+  }
+
+  private static func shutdownCompletely(_ engine: MobileEngine?) throws {
+    guard let engine else { return }
+    while true {
+      do {
+        try engine.shutdown(deadlineMs: 5_000)
+        return
+      } catch BindingError.Engine(_, .deadlineExceeded, _) {
+        continue
+      }
+    }
+  }
+
+  private static func reportLifecycleError(_ error: Error) {
+    Self.startupLog.error("UcEngine lifecycle transition failed: \(String(describing: error))")
+  }
+
+  private static func beginBackgroundActivity() -> any NativeBackgroundActivity {
+    let activity = UIKitBackgroundActivity()
+    activity.begin()
+    return activity
+  }
+
+  private static func sendReportMap(_ report: SendReport) -> [String: Any] {
+    [
+      "entryId": report.entryId,
+      "atMs": report.atMs,
+      "totalAccepted": report.totalAccepted,
+      "totalDuplicate": report.totalDuplicate,
+      "totalOffline": report.totalOffline,
+      "totalErrored": report.totalErrored,
+      "totalPending": report.totalPending,
+    ]
+  }
+
+  private static func customRelayDictionary(_ relay: CustomRelay) -> [String: Any] {
+    ["url": relay.url, "credentialConfigured": relay.credentialConfigured]
+  }
+
+  private static func relayRoutingModeName(_ mode: RelayRoutingMode) -> String {
+    switch mode {
+    case .builtIn: "builtIn"
+    case .custom: "custom"
+    case .disabled: "disabled"
+    }
+  }
+
+  private static func relayOverviewDictionary(_ overview: RelayOverview) -> [String: Any] {
+    var mapped: [String: Any] = [
+      "savedMode": relayRoutingModeName(overview.savedMode),
+      "changePending": overview.changePending,
+      "entries": overview.entries.map { entry -> [String: Any] in
+        var item: [String: Any] = [
+          "source": entry.source == .builtIn ? "builtIn" : "custom",
+          "url": entry.url,
+          "credentialConfigured": entry.credentialConfigured,
+          "inEffect": entry.inEffect,
+        ]
+        if let regionId = entry.regionId { item["regionId"] = regionId }
+        return item
+      },
+    ]
+    if let appliedMode = overview.appliedMode {
+      mapped["appliedMode"] = relayRoutingModeName(appliedMode)
+    }
+    return mapped
+  }
+
+  private static func customRelayMutationDictionary(
+    _ result: CustomRelayMutationResult
+  ) -> [String: Any] {
+    var mapped: [String: Any] = ["relays": result.relays.map(customRelayDictionary)]
+    switch result.rejection {
+    case .invalidUrl: mapped["rejection"] = "invalidUrl"
+    case .duplicate: mapped["rejection"] = "duplicate"
+    case .notFound: mapped["rejection"] = "notFound"
+    case nil: break
+    }
+    return mapped
+  }
+
+  private static func resendOutcomeMap(_ outcome: ResendEntryOutcome) -> [String: Any] {
+    switch outcome {
+    case .completed(let reconciled, let accepted, let duplicate, let offline, let errored, let pending):
+      return [
+        "kind": "completed",
+        "reconciled": reconciled.map(Self.resendTargetProgressMap),
+        "accepted": accepted,
+        "duplicate": duplicate,
+        "offline": offline,
+        "errored": errored,
+        "pending": pending,
+      ]
+    case .synchronizationDisabled:
+      return ["kind": "synchronizationDisabled"]
+    case .entryNotFound(let entryId):
+      return ["kind": "entryNotFound", "entryId": entryId]
+    case .entryNotResendable(let entryId, let reason):
+      let reasonName = switch reason {
+      case .remoteOrigin: "remoteOrigin"
+      case .payloadLost: "payloadLost"
+      }
+      return ["kind": "entryNotResendable", "entryId": entryId, "reason": reasonName]
+    case .targetNotTrusted(let deviceId):
+      return ["kind": "targetNotTrusted", "deviceId": deviceId]
+    case .noEligibleTargets:
+      return ["kind": "noEligibleTargets"]
+    }
+  }
+
+  private static func outboundProgressMap(_ progress: OutboundProgress) -> [String: Any] {
+    [
+      "entryId": progress.entryId,
+      "targetDeviceId": progress.targetDeviceId,
+      "attemptId": progress.attemptId ?? NSNull(),
+      "revision": String(progress.revision),
+      "freshness": progress.freshness,
+      "freshnessAvailable": progress.freshnessAvailable,
+      "state": progress.state,
+      "itemsTotal": progress.itemsTotal,
+      "itemsWaiting": progress.itemsWaiting,
+      "itemsRunning": progress.itemsRunning,
+      "itemsCompleted": progress.itemsCompleted,
+      "itemsFailed": progress.itemsFailed,
+      "itemsCancelled": progress.itemsCancelled,
+      "itemsUnconfirmed": progress.itemsUnconfirmed,
+      "items": progress.items.map { item -> [String: Any] in
+        [
+          "kind": item.kind,
+          "index": item.index,
+          "state": item.state,
+          "lastKnownPhase": item.lastKnownPhase ?? NSNull(),
+          "round": item.round ?? NSNull(),
+          "completedBytes": item.completedBytes .map { String($0) } ?? NSNull(),
+          "totalBytes": item.totalBytes .map { String($0) } ?? NSNull(),
+          "failureReason": item.failureReason ?? NSNull(),
+          "cancellationReason": item.cancellationReason ?? NSNull(),
+        ]
+      },
+    ]
+  }
+  private static func resendTargetProgressMap(_ target: ResendTargetProgress) -> [String: Any] {
+    [
+      "targetDeviceId": target.targetDeviceId,
+      "state": target.state,
+      "current": target.current.map(Self.outboundProgressMap) ?? NSNull(),
+      "newTransferRequested": target.newTransferRequested,
+      "duplicateFilesPossible": target.duplicateFilesPossible,
+    ]
+  }
+
+  private static func receiveProgressMap(_ progress: ReceiveProgress) -> [String: Any] {
+    [
+      "entryId": progress.entryId,
+      "attemptId": progress.attemptId,
+      "state": progress.state,
+      "totalBytes": progress.totalBytes,
+      "completedBytes": progress.completedBytes,
+      "itemsTotal": progress.itemsTotal,
+      "itemsCompleted": progress.itemsCompleted,
+      "items": progress.items.map { item -> [String: Any] in
+        [
+          "itemId": item.itemId,
+          "kind": item.kind,
+          "state": item.state,
+          "failureReason": item.failureReason ?? NSNull(),
+        ]
+      },
+    ]
+  }
+
+  private static func receiveRetryOutcomeMap(_ outcome: ReceiveRetryOutcome) -> [String: Any] {
+    switch outcome {
+    case .accepted(let attemptId):
+      return ["kind": "accepted", "attemptId": attemptId]
+    case .alreadyReceiving:
+      return ["kind": "alreadyReceiving"]
+    case .superseded:
+      return ["kind": "superseded"]
+    case .cancellationIncomplete:
+      return ["kind": "cancellationIncomplete"]
+    case .unavailable(let reason):
+      return ["kind": "unavailable", "reason": reason]
+    }
+  }
+
+  private static func failureMap(_ failure: BindingFailure) -> [String: Any] {
+    [
+      "code": failure.code,
+      "category": String(describing: failure.category),
+      "retryable": failure.retryable,
+    ]
+  }
+
+  /// Reports an Engine failure as data so JS reads code, category and retryable
+  /// from fields instead of parsing the bridge error message.
+  private static func engineResult(
+    _ operation: () throws -> [String: Any]
+  ) throws -> [String: Any] {
+    do {
+      return ["ok": true, "value": try operation()]
+    } catch let bindingError as BindingError {
+      guard case let .Engine(code, category, retryable) = bindingError else { throw bindingError }
+      return [
+        "ok": false,
+        "failure": engineFailureMap(code: code, category: category, retryable: retryable),
+      ]
+    }
+  }
+
+  private static func engineFailureMap(
+    code: UInt32,
+    category: BindingErrorCategory,
+    retryable: Bool
+  ) -> [String: Any] {
+    [
+      "code": code,
+      "category": String(describing: category),
+      "retryable": retryable,
+    ]
+  }
+
+  private static func eventMap(_ event: BindingEvent) -> [String: Any?] {
+    switch event {
+    case .stateChanged(let state):
+      return ["type": "stateChanged", "state": stateName(state)]
+    case .operationFinished(let operationId, let terminal, let failure):
+      return [
+        "type": "operationFinished",
+        "operationId": operationId,
+        "terminal": String(describing: terminal),
+        "failure": failure.map(failureMap),
+      ]
+    case .lifecycleFailed(let action, let failure):
+      return [
+        "type": "lifecycleFailed",
+        "action": lifecycleActionName(action),
+        "failure": failureMap(failure),
+      ]
+    case .refreshRequired(let reason):
+      return ["type": "refreshRequired", "reason": String(describing: reason)]
+    case .fatal(let failure):
+      return ["type": "fatal", "failure": failureMap(failure)]
+    case .incomingEntry(let entryId, let attemptId, let preview, let origin):
+      return [
+        "type": "incomingEntry",
+        "entryId": entryId,
+        "attemptId": attemptId,
+        "preview": preview,
+        "origin": String(describing: origin),
+      ]
+    case .incomingPending(let entryId, let attemptId, let fromDevice, let totalBytes, let filenames):
+      return [
+        "type": "incomingPending",
+        "entryId": entryId,
+        "attemptId": attemptId,
+        "fromDevice": fromDevice,
+        "totalBytes": totalBytes,
+        "filenames": filenames,
+      ]
+    case .receiveAttemptStateChanged(let entryId, let attemptId, let state):
+      return [
+        "type": "receiveAttemptStateChanged",
+        "entryId": entryId,
+        "attemptId": attemptId,
+        "state": state,
+      ]
+    case .deliveryStatusChanged(let entryId, let targetDeviceId):
+      return [
+        "type": "deliveryStatusChanged",
+        "entryId": entryId,
+        "targetDeviceId": targetDeviceId,
+      ]
+    case .peerPresenceChanged(let deviceId, let state, let atMs):
+      return [
+        "type": "peerPresenceChanged",
+        "deviceId": deviceId,
+        "state": state,
+        "atMs": atMs,
+      ]
+    case .outboundProgressChanged:
+      return ["type": "outboundProgressChanged"]
+    case .receiveProgressChanged:
+      return ["type": "receiveProgressChanged"]
+    case .transferProgress(
+      let transferId,
+      let entryId,
+      let attemptId,
+      let peerId,
+      let direction,
+      let completedBytes,
+      let totalBytes
+    ):
+      return [
+        "type": "transferProgress",
+        "transferId": transferId,
+        "entryId": entryId,
+        "attemptId": attemptId,
+        "peerId": peerId,
+        "direction": String(describing: direction),
+        "completedBytes": completedBytes,
+        "totalBytes": totalBytes,
+      ]
+    case .transferStatusChanged(
+      let transferId,
+      let entryId,
+      let attemptId,
+      let status,
+      let reason
+    ):
+      return [
+        "type": "transferStatusChanged",
+        "transferId": transferId,
+        "entryId": entryId,
+        "attemptId": attemptId,
+        "status": status,
+        "reason": reason,
+      ]
+    case .activeClipboardChanged(let snapshotHash, let entryId, let activatedAtMs, let activatedBy):
+      return [
+        "type": "activeClipboardChanged",
+        "snapshotHash": snapshotHash,
+        "entryId": entryId,
+        "activatedAtMs": activatedAtMs,
+        "activatedBy": activatedBy,
+      ]
+    case .deviceTrustChanged(let revision):
+      return ["type": "deviceTrustChanged", "revision": revision]
+    case .rePairingRequired(let scope):
+      let scopeName = switch scope {
+      case .allDevices: "allDevices"
+      }
+      return ["type": "rePairingRequired", "scope": scopeName]
+    case .networkRecoveryChanged(let phase, let retryable, let nextRetryInMs):
+      return [
+        "type": "networkRecoveryChanged",
+        "phase": phase,
+        "retryable": retryable,
+        "nextRetryInMs": nextRetryInMs,
+      ]
+    case .changed(let kind):
+      return ["type": "changed", "kind": kind]
+    }
+  }
+
+  private static func lifecycleActionName(_ action: BindingLifecycleAction) -> String {
+    switch action {
+    case .suspend: "suspend"
+    case .resume: "resume"
+    }
+  }
+
+  private static func stateName(_ state: BindingEngineState) -> String {
+    switch state {
+    case .running: "running"
+    case .quiescing: "quiescing"
+    case .quiesced: "quiesced"
+    case .suspended: "suspended"
+    case .shuttingDown: "shuttingDown"
+    case .stopped: "stopped"
+    }
+  }
+
+  private static func restoreMode(_ value: String) -> BindingClipboardRestoreMode {
+    switch value {
+    case "plainText": .plainText
+    case "filePaths": .filePaths
+    default: .standard
+    }
+  }
+
+  private static func restoreOutcome(_ value: BindingClipboardRestoreOutcome) -> String {
+    switch value {
+    case .restored: "restored"
+    case .payloadUnavailable: "payloadUnavailable"
+    case .notApplicable: "notApplicable"
+    }
+  }
+
+  private static func workspaceConvergenceMap(_ convergence: WorkspaceConvergence) -> [String: Any?] {
+    let phase: String
+    switch convergence.phase {
+    case .locallyApplied: phase = "locallyApplied"
+    case .converging: phase = "converging"
+    case .complete: phase = "complete"
+    case .recoveryRequired: phase = "recoveryRequired"
+    }
+    let failureCategory: String?
+    switch convergence.failureCategory {
+    case .spaceMismatch: failureCategory = "spaceMismatch"
+    case .continuityGap: failureCategory = "continuityGap"
+    case .identityMismatch: failureCategory = "identityMismatch"
+    case .digestConflict: failureCategory = "digestConflict"
+    case .unauthorized: failureCategory = "unauthorized"
+    case .versionIncompatible: failureCategory = "versionIncompatible"
+    case .noEffectiveMembers: failureCategory = "noEffectiveMembers"
+    case .storage: failureCategory = "storage"
+    case nil: failureCategory = nil
+    }
+    return [
+      "phase": phase,
+      "revision": convergence.revision,
+      "historyEventCount": convergence.historyEventCount,
+      "effectiveMemberCount": convergence.effectiveMemberCount,
+      "pendingRemovalDecisionDeviceIds": convergence.pendingRemovalDecisionDeviceIds,
+      "pendingRemovalDecisionEventId": convergence.pendingRemovalDecisionEventId,
+      "divergedPeerDeviceIds": convergence.divergedPeerDeviceIds,
+      "upgradeRequiredPeerDeviceIds": convergence.upgradeRequiredPeerDeviceIds,
+      "convergenceDigest": convergence.convergenceDigest,
+      "removed": convergence.removed,
+      "updatedAtMs": convergence.updatedAtMs,
+      "failureCategory": failureCategory,
+    ]
+  }
+}
+
+/// Process logging is an independent owner. A flush is not a release receipt.
+private enum AppleProcessObservability {
+  static func suspend(remainingTimeMs: () -> UInt64?) throws -> Bool {
+    do {
+      var request = try releaseProcessObservability(deadlineMs: min(remainingTimeMs() ?? 1_000, 250))
+      var report = request.report
+      if report.state == .pending, let observation = request.observation {
+        report = observation.wait(deadlineMs: remainingTimeMs() ?? 1_000)
+      }
+      if report.state == .failed, report.explicitRetrySupported, (remainingTimeMs() ?? 0) > 250 {
+        request = try retryProcessObservabilityRelease(deadlineMs: min(remainingTimeMs() ?? 0, 250))
+        report = request.report
+        if report.state == .pending, let observation = request.observation {
+          report = observation.wait(deadlineMs: remainingTimeMs() ?? 0)
+        }
+      }
+      return report.state == .released
+    } catch BindingError.ObservabilityNotInstalled {
+      return true
+    }
+  }
+
+  static func resume() throws {
+    let request = try resumeProcessObservability(deadlineMs: 1_000)
+    let report = request.report.state == .pending
+      ? request.observation?.wait(deadlineMs: 1_000) ?? request.report
+      : request.report
+    guard report.state == .resumed else { throw NativeLifecycleError.observabilityUnavailable }
+  }
+}
+
+private final class UIKitBackgroundActivity: NativeBackgroundActivity, @unchecked Sendable {
+  private let lock = NSLock()
+  private var identifier: UIBackgroundTaskIdentifier = .invalid
+  private var expirationHandler: (@Sendable () -> Void)?
+
+  func begin() {
+    // Deliberately a strong capture, not `[weak self]`. Nothing else in the
+    // app retains this activity once the background transition that created
+    // it returns without calling `end()` (the deadline-exceeded failure
+    // path), so a weak capture would already be nil by the time UIKit calls
+    // this handler later, and `endBackgroundTask` would never fire -- leaking
+    // the real OS-level assertion (CodeRabbit review, PR #60; proved with a
+    // generic ARC repro in `library/evidence/cross-process-flock-harness`
+    // Scenario E, since `UIApplication` cannot run outside an iOS process
+    // here). The strong reference is held only by UIKit itself, for exactly
+    // as long as the background task is outstanding; it is released the
+    // moment `endBackgroundTask` is called from either `end()` or `expire()`.
+    let identifier = UIApplication.shared.beginBackgroundTask(
+      withName: "Unoscil Engine Suspend",
+      expirationHandler: { self.expire() }
+    )
+    lock.withLock { self.identifier = identifier }
+  }
+
+  var remainingTimeMs: UInt64? {
+    NativeBackgroundDeadline.remainingTimeMs(
+      systemRemainingSeconds: UIApplication.shared.backgroundTimeRemaining
+    )
+  }
+
+  func end() {
+    guard let active = takeIdentifier() else { return }
+    // `end()` can be called from this module's own serial lifecycle queue,
+    // not necessarily the main thread; marshal over asynchronously since
+    // nothing here is racing a deadline the way `expire()` is.
+    DispatchQueue.main.async {
+      UIApplication.shared.endBackgroundTask(active)
+    }
+  }
+
+  /// Called by UIKit once the granted background time has fully run out.
+  /// `endBackgroundTask` must still be called here, exactly as it is from
+  /// `end()` — not calling it here was the second half of the host-contract
+  /// gap t-0176 found: the assertion leaked instead of being released. This
+  /// does not recover any lock the Engine was still holding at that point.
+  ///
+  /// Corrected per t-0176's review: the expiration handler already runs on
+  /// the main thread, and Apple requires `endBackgroundTask` to be called
+  /// from (not merely scheduled from) that handler. Dispatching to
+  /// `.main.async` here would defer the real call until after this handler
+  /// already returned, which does not satisfy that requirement — call it
+  /// directly instead.
+  private func expire() {
+    let handler = lock.withLock { expirationHandler }
+    guard let active = takeIdentifier() else { return }
+    handler?()
+    UIApplication.shared.endBackgroundTask(active)
+  }
+
+  func onExpiration(_ handler: @escaping @Sendable () -> Void) {
+    lock.withLock { expirationHandler = handler }
+  }
+
+  private func takeIdentifier() -> UIBackgroundTaskIdentifier? {
+    let active = lock.withLock {
+      defer {
+        identifier = .invalid
+        expirationHandler = nil
+      }
+      return identifier
+    }
+    return active == .invalid ? nil : active
+  }
+}
+
+private final class AppleEngineLifecycle: NativeEngineLifecycle {
+  private let owned: RuntimeOwnedNativeLifecycle
+
+  init(engine: MobileEngine, host: MainApplicationEngineHost) {
+    owned = RuntimeOwnedNativeLifecycle(
+      engine: AppleMobileEngineLifecycle(engine: engine),
+      ownership: MainApplicationRuntimeOwnership(host: host)
+    )
+  }
+
+  func recoverSession() throws -> NativeSessionRecovery {
+    try owned.recoverSession()
+  }
+
+  func lifecycleState() throws -> NativeEngineLifecycleState {
+    try owned.lifecycleState()
+  }
+
+  func suspend(deadlineMs: UInt64?) throws {
+    try owned.suspend(deadlineMs: deadlineMs)
+  }
+
+  func resume() throws {
+    try owned.resume()
+  }
+
+  func notifyForegroundOpportunity() throws {
+    try owned.notifyForegroundOpportunity()
+  }
+}
+
+private final class AppleMobileEngineLifecycle: NativeEngineLifecycle {
+  private let engine: MobileEngine
+
+  init(engine: MobileEngine) {
+    self.engine = engine
+  }
+
+  func recoverSession() throws -> NativeSessionRecovery {
+    let recovery = try AppleNativeDiagnostics.observe(.secureStateRecovery) {
+      try engine.recoverSession(allowSecureStorageUnlock: true)
+    }
+    return NativeSessionRecovery(unlocked: recovery.unlocked, resumed: recovery.resumed)
+  }
+
+  func lifecycleState() throws -> NativeEngineLifecycleState {
+    switch try engine.lifecycleState() {
+    case .running: .running
+    case .quiescing: .quiescing
+    case .quiesced: .quiesced
+    case .suspended: .suspended
+    case .shuttingDown: .shuttingDown
+    case .stopped: .stopped
+    }
+  }
+
+  func suspend(deadlineMs: UInt64?) throws {
+    do {
+      try AppleNativeDiagnostics.observe(.engineSuspend) {
+        if let deadlineMs {
+          try engine.suspendWithDeadline(deadlineMs: deadlineMs)
+        } else {
+          try engine.suspend()
+        }
+      }
+    } catch BindingError.Engine(_, .deadlineExceeded, _) {
+      // The Engine's own contract: a deadline failure means the transition
+      // did not complete, not that it is safe. The Engine stays `.quiesced`
+      // and any lock it held when the deadline fired is still held; this
+      // only turns that signal into something the lifecycle-agnostic retry
+      // policy in `NativeLifecycleHost` can act on.
+      throw NativeLifecycleError.deadlineExceeded
+    }
+  }
+
+  func resume() throws {
+    try AppleNativeDiagnostics.observe(.engineResume) { try engine.resume() }
+  }
+
+  func notifyForegroundOpportunity() throws {
+    try engine.notifyConnectivityOpportunity(reason: .foreground)
+  }
+}
+
+private final class AppleStartupLifecycle: NativeEngineLifecycle {
+  private let lifecycle: MobileStartupLifecycle
+
+  init(_ lifecycle: MobileStartupLifecycle) {
+    self.lifecycle = lifecycle
+  }
+
+  var isStartupLifecycle: Bool { true }
+  func recoverSession() throws -> NativeSessionRecovery { .init(unlocked: false, resumed: false) }
+  func lifecycleState() throws -> NativeEngineLifecycleState { .running }
+  func suspend(deadlineMs: UInt64?) throws {
+    do {
+      if let deadlineMs {
+        try lifecycle.suspendWithDeadline(deadlineMs: deadlineMs)
+      } else {
+        try lifecycle.suspend()
+      }
+    } catch BindingError.Engine(_, .deadlineExceeded, _) {
+      throw NativeLifecycleError.deadlineExceeded
+    }
+  }
+  func resume() throws { try lifecycle.resume() }
+  func notifyForegroundOpportunity() throws {}
+}
+
+private final class MainApplicationRuntimeOwnership: NativeRuntimeOwnership {
+  private let host: MainApplicationEngineHost
+
+  init(host: MainApplicationEngineHost) {
+    self.host = host
+  }
+
+  func acquire(timeoutMs: UInt64) throws -> Bool {
+    try host.acquireRuntimeOwnership(timeoutMs: timeoutMs)
+  }
+
+  func release() {
+    host.releaseRuntimeOwnership()
+  }
+}
+
+private final class UcEngineNotStartedException: Exception, @unchecked Sendable {
+  override var reason: String { "The shared P2P engine has not been started" }
+}
+
+private final class UcEngineAlreadyStartedException: Exception, @unchecked Sendable {
+  override var reason: String { "The shared P2P engine is already running" }
+}
+
+private final class UcEngineInvalidInputException: Exception, @unchecked Sendable {
+  override var reason: String { "The device trust choice is invalid" }
+}
+
+private extension NSLock {
+  func withLock<T>(_ operation: () throws -> T) rethrows -> T {
+    lock()
+    defer { unlock() }
+    return try operation()
+  }
+}
+
+private final class UcEngineInvalidConnectivityOpportunityException: Exception, @unchecked Sendable {
+  override var reason: String { "Invalid connectivity opportunity" }
+}

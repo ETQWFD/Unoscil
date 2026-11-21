@@ -1,0 +1,19 @@
+appId: ${APP_ID}
+---
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      # Native navigation back button, then the Clipboard tab.
+      - tapOn:
+          id: BackButton
+      - assertVisible:
+          id: settings-diagnostics
+      - tapOn: "Clipboard"
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - back
+      - back
+- runFlow: ../../assertions/home-ready.yaml

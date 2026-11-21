@@ -1,0 +1,27 @@
+appId: ${APP_ID}
+---
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      # Android: relay lives in the Space settings page under the Devices destination
+      - scrollUntilVisible:
+          element:
+            id: space-settings
+          direction: DOWN
+      - tapOn:
+          id: space-settings
+      - tapOn:
+          id: relay-settings
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - swipe:
+          start: "50%,85%"
+          end: "50%,25%"
+          duration: 800
+      - waitForAnimationToEnd
+- extendedWaitUntil:
+    visible: "Add relay node"
+    timeout: 15000

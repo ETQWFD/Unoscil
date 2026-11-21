@@ -1,0 +1,427 @@
+# Release & Versioning Guide
+
+This document describes the versioning policy, upstream-sync workflow, and
+release process for Unoscil.
+
+## Versioning Policy
+
+Unoscil uses **two independent axes**, so our fast release cadence does not keep
+re-triggering iOS App Store / TestFlight review:
+
+1. **Marketing version** — `expo.version`, a 3-segment `MAJOR.MINOR.PATCH`
+   ([SemVer](https://semver.org/)), independent from the upstream
+   `Jeric-X/syncclipboard-mobile` project. This maps to the iOS
+   `CFBundleShortVersionString`. **Apple re-reviews whenever this changes**, so
+   it is bumped **deliberately and rarely** — at feature milestones, not every
+   release.
+   - **PATCH (`1.0.X`)** — bug fixes only, no user-visible behavior change.
+   - **MINOR (`1.X.0`)** — new features, backward compatible.
+   - **MAJOR (`X.0.0`)** — breaking changes (protocol break, removed feature,
+     data-format migration).
+2. **Build counter** — a single monotonic integer bumped **every** release. It
+   drives both `expo.android.versionCode` and `expo.ios.buildNumber` (kept
+   equal), and is the 4th segment of the git tag. On iOS only the
+   `CFBundleVersion` changes → no review. Our fast cadence rides on this axis.
+
+> **Snapshot point:** version `1.0.11` (versionCode 152) was the alignment
+> snapshot where Unoscil last shared a version number with upstream. From then
+> on the two axes evolve independently.
+
+### Build Counter Rule
+
+The build counter **must increase monotonically** across every published
+artifact, including betas and marketing-version bumps (it is never reset). The
+rule is simple:
+
+> Every published artifact bumps the build counter by 1;
+> `versionCode` and `ios.buildNumber` are both set to it.
+
+"Every published artifact" includes a two-platform release, an Android-only
+release, an iOS-only release, and a TestFlight dev upload. A number consumed by
+one platform is never reused by the other, so a single platform may skip
+numbers:
+
+| Published            | Platforms | Build | Android sees | iOS sees |
+| -------------------- | --------- | ----- | ------------ | -------- |
+| v2.0.0.187           | Android   | 187   | 187          | —        |
+| v2.0.0.188           | iOS       | 188   | —            | 188      |
+| TestFlight dev build | iOS       | 189   | —            | 189      |
+| v2.0.0.190           | both      | 190   | 190          | 190      |
+
+Two ledgers record consumed numbers: release tags on origin (every release is
+tagged, whatever its platforms) and App Store Connect (TestFlight dev uploads
+are not tagged). `npm run release:build`, `release:alpha`, and
+`release:version` pick the next number past both `app.json` and the highest
+release tag on origin. `npm run release:check-build` refuses a number that a
+tag already used; CI runs the same check with App Store Connect included
+before every release and every TestFlight dev upload. When that check reports
+an untagged number, bump past it with `npm run release:build -- --after N`.
+
+| Release            | expo.version (iOS marketing) | build counter | Android versionName | iOS review? |
+| ------------------ | ---------------------------- | ------------- | ------------------- | ----------- |
+| v1.3.0.156         | 1.3.0 (frozen)               | 156           | 1.3.0.156           | no          |
+| v1.3.0.157         | 1.3.0 (frozen)               | 157           | 1.3.0.157           | no          |
+| v1.4.0.158         | 1.4.0 (bumped)               | 158           | 1.4.0.158           | **yes**     |
+| v1.4.0.159         | 1.4.0 (frozen)               | 159           | 1.4.0.159           | no          |
+| v1.4.0.160-alpha.1 | 1.4.0 (frozen)               | 160           | 1.4.0.160-alpha.1   | no          |
+
+### Android self-update depends on the tag — do NOT change its shape
+
+Android is sideload-only: the in-app updater (`src/services/UpdateService.ts`)
+compares the **installed `versionName`** against the **latest GitHub release
+tag**. Two hard constraints follow:
+
+- The Android `versionName` MUST carry the build counter as a 4th segment
+  (`1.3.0.156`), followed by `-alpha.N` for an Alpha release. This is injected at prebuild by
+  `plugins/withAndroidBuildVersionName.ts` (from `expo.version` +
+  `expo.android.versionCode`). Without it, a user already on the newest build
+  compares `1.3.0` against tag `v1.3.0.156` and sees a **permanent false
+  "update available"**.
+- The tag MUST be a form the app accepts: `vX.Y.Z.B` or
+  `vX.Y.Z.B-alpha.N`. Separators like `v1.3.0-b5` or `v1.3.0+5` **fail to parse** and
+  silently disable update detection.
+
+### Tag Naming
+
+- **Stable:** `vX.Y.Z.B` (e.g. `v1.3.0.156`) — the `.B` is the build counter.
+- **Alpha:** `vX.Y.Z.B-alpha.N` (e.g. `v1.3.0.156-alpha.1`).
+
+An Alpha tag publishes an Android test build and an iOS TestFlight build. iOS
+always reads its marketing version from `app.json` `expo.version` (three
+segments only), so TestFlight shows `1.3.0 (156)` rather than an unsupported
+`1.3.0-alpha` version. The Alpha label remains in the release tag and the
+TestFlight testing notes.
+
+## Localized Changelog Format
+
+Every release is recorded in two files:
+
+- `CHANGES.md` contains Simplified Chinese notes.
+- `CHANGES.en.md` contains the matching English notes.
+
+The first line of both top sections is the same bare tag (`vX.Y.Z.B`). Keep it
+unchanged: `npm run release:validate` rejects a release if either tag does not
+match `app.json`, if the two files drift apart, or if either top section cannot
+produce release notes. Everything below the tag, up to the next tag line, is the
+notes body for that release.
+
+Each language ships one shared changelog for iOS and Android.
+`scripts/release-notes.mjs` splits each top block with three optional headings:
+
+- `### 通用` in `CHANGES.md` or `### Common` in `CHANGES.en.md` applies to both
+  platforms.
+- `### iOS` applies only to iOS.
+- `### Android` applies only to Android.
+
+The generator produces:
+
+- **Versioned client changelogs:** committed files named
+  `changelogs/vX.Y.Z.B.<platform>.<language>.md`, where `platform` is `android`
+  or `ios` and `language` is `zh` or `en`. Each file contains common notes plus
+  notes for that platform. The Android updater fetches the file from the exact
+  release tag; it does not read the GitHub Release body. Non-Chinese app
+  languages currently use the English file.
+- **GitHub Release body:** visible `[zh-CN] 简体中文` and `[en] English`
+  sections for people viewing the release page, each containing Android and iOS
+  notes.
+- **TestFlight "What to Test":** Chinese iOS notes for `zh-Hans` and English
+  iOS notes for `en-US`. The publishing script updates existing localizations,
+  creates either one when missing, and reports request failures only after
+  attempting both.
+
+Run `npm run changelog:generate` after editing the top CHANGES blocks and commit
+all four generated files. `npm run release:validate` rejects missing or stale
+client changelog files before the release tag can be created.
+
+### Stable Notes Compare Against the Previous Stable
+
+A stable release's notes describe what a user upgrading from the previous
+stable release will notice, not the history of the alpha cycle in between.
+For `v2.0.0.B`, the baseline is the last `1.3.x` stable build, not the last
+alpha.
+
+- **Do not concatenate alpha blocks.** Rewrite the stable block from the net
+  difference between the previous stable and this build.
+- **Fixes must predate the cycle.** A `修复` / `Fix` bullet belongs in stable
+  notes only when the problem was reachable in the previous stable release.
+  Fixes for regressions introduced and resolved during the alpha cycle are
+  development noise; drop them.
+- **Collapse intermediate states.** A feature added in one alpha and reworked
+  in a later one is one bullet describing the final behavior. Intermediate
+  sync-core versions are dropped; mention only the final one if relevant.
+- **When unsure whether a bug existed before**, check the previous stable's
+  code or `CHANGES.md` entries up to that tag. If it cannot be established,
+  leave the bullet out.
+
+Alpha notes are different: testers compare against the previous alpha, so
+alpha-cycle fixes do belong in alpha blocks.
+
+Bullets may still carry a provenance tag (`[uc]` for Unoscil-specific changes,
+`[upstream]` for changes ported from `Jeric-X/syncclipboard-mobile` /
+`Jeric-X/SyncClipboard`, with a commit/PR ref when possible).
+
+Run `node scripts/release-notes.mjs --print` locally to preview both languages
+and both platforms before pushing. `npm run release:validate` performs the same
+parsing check without writing release artifacts.
+
+### Example
+
+`CHANGES.md`:
+
+```
+v1.3.0.158
+
+### 通用
+- 修复：完成配对后未正确接入待处理的连接
+
+### iOS
+- 功能：保存文件时可自行选择保存位置
+```
+
+`CHANGES.en.md`:
+
+```
+v1.3.0.158
+
+### Common
+- Fix: Pending connections are adopted after pairing
+
+### iOS
+- Feature: Choose where to save files
+```
+
+**Backward compatible:** a flat block with no sub-headings still routes bullets
+to both platforms. Legacy inline platform tags are also still supported.
+
+## Upstream Sync Workflow
+
+Unoscil is a **clean-room re-implementation** of the SyncClipboard protocol
+(TypeScript / Expo), not a git-level fork of the upstream Android app. Merging
+is therefore manual.
+
+Routine:
+
+1. **Watch** `Jeric-X/syncclipboard-mobile` and `Jeric-X/SyncClipboard` on
+   GitHub for new releases.
+2. **Triage** new commits since the last sync. Focus on:
+   - **Protocol-layer** changes (API fields, signatures, file chunking,
+     SignalR contracts) — must port; servers are shared.
+   - **Cross-platform logic** bugs (sync race conditions, retry logic) —
+     usually applicable.
+   - Android-platform fixes (background services, permissions) — port only if
+     Unoscil exhibits the same issue.
+   - **Skip** anything specific to upstream's stack (MAUI, .NET, their UI).
+3. **Port manually** into Unoscil's corresponding module
+   (`modules/*`, `src/services/*`, plugins, etc.). Do not `cherry-pick` —
+   technical stacks differ.
+4. **Commit** with an upstream reference, e.g.:
+
+   ```
+   fix: handle sync retry after token refresh
+
+   Ref: Jeric-X/syncclipboard-mobile@abc1234
+   ```
+
+5. **Record** the change in `CHANGES.md` and `CHANGES.en.md` under the current
+   development version, prefixed with `[upstream]`.
+
+### Tracking the Sync Point
+
+When a Unoscil release ships, optionally record the upstream version it has
+been synced to in the release notes or the in-app About page, e.g.
+"Tracked upstream: v1.0.13 (2026-06-XX)". Unoscil's own version stays
+independent.
+
+## Release Workflow
+
+### Pre-release Checklist
+
+- [ ] All upstream fixes intended for this release have been ported and
+      recorded in both changelog files.
+- [ ] Alpha build (if one was published) has been verified on a physical
+      device, including any long-running scenarios mentioned in the
+      changelog.
+- [ ] `CHANGES.md` and `CHANGES.en.md` top sections contain equivalent final
+      release notes and start with the same full tag `vX.Y.Z.B`.
+- [ ] For a stable release, the notes compare against the previous stable
+      release and contain no fixes for alpha-only regressions (see
+      "Stable Notes Compare Against the Previous Stable").
+- [ ] `npm run changelog:generate` was run and all four matching files under
+      `changelogs/` are committed.
+- [ ] `app.json` build metadata was bumped with the scripts below (never
+      hand-edit `versionCode` / `buildNumber` — that risks the two drifting).
+- [ ] Working tree is clean.
+- [ ] The release metadata commit has been pushed to `main`.
+
+### Steps
+
+Pick the axis. **Most releases are build-only** (marketing version frozen, no
+iOS review):
+
+```sh
+# 1a. Build-only release (frequent): bump the counter, keep expo.version frozen.
+npm run release:build            # add --dry-run first to preview
+
+# 1b. Alpha release: creates the next monotonic build and Alpha tag.
+npm run release:alpha             # add --dry-run first to preview
+
+# 1c. OR marketing-version release (rare, re-triggers iOS review):
+npm run release:version -- 1.4.0
+```
+
+Both scripts edit `app.json` and print the derived tag. Then:
+
+```sh
+# 2. Add matching "vX.Y.Z.B" sections to CHANGES.md and CHANGES.en.md,
+#    then generate the per-platform client changelogs.
+npm run changelog:generate
+
+# 3. Commit and push the release metadata. Do not create or push the tag.
+git add app.json CHANGES.md CHANGES.en.md changelogs
+git commit -m "chore(release): X.Y.Z.B"
+git push origin main
+```
+
+In GitHub Actions, open `release`, choose **Run workflow** on `main`, and
+choose `platforms` (`both`, `android`, or `ios`). The workflow then:
+
+1. Validates that Android/iOS build counters and both changelog files describe
+   the same release, and that both top sections can generate release notes.
+2. Refuses the build number if a release tag or App Store Connect already has
+   it (see "Build Counter Rule").
+3. Builds the selected Android and/or iOS platforms. Quality checks run in
+   the separate PR and main-push CI workflows, not in this release workflow.
+4. Creates the derived tag only after release preparation and the selected
+   builds succeed.
+5. iOS selected: uploads the same validated iOS artifact to TestFlight.
+6. Publishes a GitHub Release whose body covers the selected platforms. With
+   Android, it carries the `arm64-v8a` APK supported by the unified engine
+   release. An iOS-only release has no APK and never becomes GitHub's
+   "latest" release.
+7. Android selected: uploads the immutable APK to Cloudflare R2 and registers
+   a Ready release in FlareRelease, leaving Stable and Beta unchanged until a
+   maintainer explicitly promotes it. The Android updater reads FlareRelease
+   channels, so an iOS-only release never offers Android users an update.
+
+8. Android selected: the optional `mirror-android-gitcode` job copies the same
+   APK to a GitCode Release (see "GitCode mirror"). It runs after the FlareRelease
+   registration and can never fail the release.
+
+A single-platform release still uses the shared `CHANGES.md` block; only the
+platform that ships reads its notes. Write the block for the platform being
+released.
+
+FlareRelease registration uses the `Unoscil` organization's
+`FLARE_RELEASE_ACCESS_CLIENT_ID` and `FLARE_RELEASE_ACCESS_CLIENT_SECRET`
+GitHub Actions secrets. The organization secrets must grant this repository
+access. Registration never selects a channel; release approval and channel
+changes remain explicit operations in FlareRelease.
+
+Directly pushing a `v*` tag does not publish a release. If a publishing job
+fails after the tag was created, use **Re-run failed jobs** on the same Actions
+run so successful builds and destinations are not repeated.
+
+### GitCode mirror
+
+GitHub and R2 stay the authoritative sources. When configured, the same signed
+`arm64-v8a` APK is also uploaded to a GitCode Release so FlareRelease can send
+users in mainland China to it (FlareRelease README, "Download mirrors"; both
+repositories are driven by thread t-0153). Whether this is faster for users has
+not been measured; do not announce it as faster before it is.
+
+**Where the transfer runs.** GitCode's upload endpoint is in mainland China. Measured
+on 2026-10-03: a GitHub runner could not finish a 94 MiB upload in 10 minutes, a host in
+Singapore reached about 10 KiB/s, a host in Shanghai about 0.8 MiB/s (94 MiB in under two
+minutes) and a laptop in China about 2.7 MiB/s. R2 is the opposite: the Shanghai host
+downloads the APK from `release.unoscil.app` at about 1.3 MiB/s but GitHub release
+assets at 17 KiB/s. So the `mirror-android-gitcode` job logs in to a Shanghai host over SSH
+and the transfer happens there:
+
+1. The job takes the APK that was released (the build artifact, or the GitHub Release for
+   a manual run) only to compute its SHA-256.
+2. It sends **one JSON line and nothing else** through the SSH session: tag, file name,
+   that digest, the SHA-256 of `scripts/mirror-android-apk-to-gitcode.mjs` in this commit,
+   and the settings, including the GitCode token (read by `jq` from the environment, never
+   a command-line argument). No code travels: the upload script is installed on the host,
+   owned by root, and the host refuses to run a script whose digest differs from the one the
+   job expects, so a changed script has to be deployed deliberately.
+3. The key on the host is restricted (`restrict,command=...`) to
+   `scripts/remote/gitcode-mirror-host.py`, which validates the request (release tag, APK
+   name, digests, allow-listed settings only, no extra data), downloads the APK from R2,
+   checks its SHA-256 against the digest, runs the installed script with Node and prints the
+   provenance. It removes everything it created. Nothing is stored on the host.
+4. The script hashes the file again, makes sure the GitCode release exists, reuses an
+   identical existing file (a different one fails without being overwritten or deleted),
+   otherwise uploads it (bounded timeouts, three attempts, a fresh upload address each
+   time, no progress for two minutes is abandoned, progress is logged), downloads it back
+   **without credentials** with every redirect hop checked for https, requires the same
+   size and SHA-256, and registers it with `PUT /api/mirrors`. FlareRelease enables the
+   mirror only if size and SHA-256 equal the registered artifact.
+
+Configuration, all outside the repository and never printed:
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `MIRROR_SSH_KEY` | secret of the `mirror` environment | Private key of the restricted SSH key. The environment only admits the `main` branch, so a workflow on any other branch cannot use the key |
+| `MIRROR_SSH_HOST`, `MIRROR_SSH_USER`, `MIRROR_SSH_PORT` | variables | The Shanghai host, its unprivileged user (`unoscil-mirror`) and an optional port |
+| `MIRROR_SSH_KNOWN_HOSTS` | variable | The host's public keys (`ssh-keyscan` output, compared with the host's own keys) |
+| `GITCODE_RELEASE_TOKEN` | secret | GitCode bot token with release write access to the mirror repository only |
+| `GITCODE_OWNER`, `GITCODE_REPO` | variables | The existing mirror repository (needs at least one commit on its default branch) |
+| `GITCODE_API_BASE` | variable, optional | Defaults to `https://api.gitcode.com/api/v5` |
+| `GITCODE_TARGET_COMMITISH` | variable, optional | Branch used when a release tag has to be created, default `main` |
+| `FLARE_RELEASE_ACCESS_CLIENT_ID`, `FLARE_RELEASE_ACCESS_CLIENT_SECRET` | secrets | Already used for registration |
+
+The host (CentOS 7, glibc 2.17) has Node 22 from the Node.js unofficial glibc-2.17 build
+under `~unoscil-mirror/node` (the official Node 22 needs a newer glibc), the wrapper and the
+upload script in `/opt/unoscil-mirror/` (owned by root, so the key cannot change them) and
+the public half of the key in `~unoscil-mirror/.ssh/authorized_keys`. Run
+`scripts/remote/deploy-gitcode-mirror-host.sh <ssh alias with root>` after either file
+changes; until then the job fails with "the installed upload script is out of date" (which is
+a warning for a release). The host is a shared general-purpose server with an old kernel;
+the design keeps the key from running anything but this one upload, and the Access
+credential that is sent along can use the whole FlareRelease admin API, so a narrower
+service token (only `PUT /api/mirrors`) would limit the damage if the host is ever
+compromised.
+
+Failure behaviour: during a release the job is non-blocking. A missing setting, an
+unreachable host, a failed upload, or a failed verification becomes a `::warning`
+annotation, a job summary, and a `gitcode-mirror-provenance-<tag>` artifact
+(`provenance.json`: tag, file, size, SHA-256, mirror address, redirect chain, whether the
+mirror accepts range requests, never any token). The release itself is unaffected, and
+FlareRelease keeps serving the file from R2 until a mirror is verified. Because the job
+succeeds, "Re-run failed jobs" does not retry it: run **mirror-android-gitcode** from the
+Actions tab with the tag instead (it fails loudly). Repeated runs are safe.
+
+Known limits: the current Android client has no automatic fallback. If GitCode fails
+after FlareRelease redirected a user, the user must pick the GitHub source by hand.
+Withdrawing a release or revoking a mirror in FlareRelease stops new redirects but
+cannot recall a GitCode link that was already shared; the GitCode API can delete the
+attachment (`DELETE .../releases/<tag>/attach_files/<id>`). The Shanghai host is a single
+point of failure for new mirrors only; users are never affected when it is down.
+
+### Alpha Release
+
+Run `npm run release:alpha` to create the next build metadata and the next
+Alpha sequence. It prints a tag such as `v1.3.0.166-alpha.1`; use that exact
+tag as the first line of both changelog files, then use the normal manual
+`release` workflow. Android Alpha installs automatically use the test
+update channel on first launch, so they receive the next Alpha or stable build.
+CI marks Alpha tags as prereleases and uploads the iOS build to TestFlight.
+
+## Identifier Reference
+
+| Field            | Value                      |
+| ---------------- | -------------------------- |
+| Android package  | `app.unoscil.android` |
+| iOS bundle       | `app.unoscil.ios`     |
+| App display name | `Unoscil`                  |
+| Expo slug        | `unoscil`                  |
+
+These are independent namespaces from upstream. Unoscil can be installed
+alongside any other SyncClipboard-protocol client on the same device.
+
+## Issue verification
+
+Published GitHub releases request verification of ready issues. See
+[the mobile issue lifecycle](issue-lifecycle.md) for PR linking, four-part version
+commands, platform availability limits, and maintainer setup.

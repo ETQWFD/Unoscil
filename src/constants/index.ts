@@ -1,0 +1,41 @@
+/**
+ * App Constants
+ */
+
+import * as Application from 'expo-application';
+
+export const APP_NAME = 'Unoscil';
+export const APP_VERSION = Application.nativeApplicationVersion ?? '1.0.0';
+export const APP_BUILD_NUMBER = Application.nativeBuildVersion;
+export const APP_VERSION_WITH_BUILD = APP_BUILD_NUMBER
+  ? `${APP_VERSION} (${APP_BUILD_NUMBER})`
+  : APP_VERSION;
+
+// API Endpoints
+export const API_ENDPOINTS = {
+  SYNC: '/api/sync',
+  PROFILE: '/api/profile',
+  HISTORY: '/api/history',
+  UPLOAD: '/api/upload',
+  DOWNLOAD: '/api/download',
+};
+
+// Storage Keys
+export const STORAGE_KEYS = {
+  SETTINGS: '@settings',
+  SERVER_CONFIG: '@server_config',
+  CLIPBOARD_HISTORY: '@clipboard_history',
+  LAST_SYNC_TIME: '@last_sync_time',
+};
+
+export { DEFAULT_SETTINGS } from '../types/settings';
+
+// Supported Image MIME Types
+export const IMAGE_MIME_TYPES = [
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/gif',
+  'image/bmp',
+  'image/webp',
+];

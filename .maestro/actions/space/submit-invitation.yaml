@@ -1,0 +1,30 @@
+appId: ${APP_ID}
+---
+- runFlow: ../devices/open.yaml
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: sync-channel-p2p
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - tapOn: "Direct \\(Experimental\\)"
+- tapOn: "Use direct sync"
+- extendedWaitUntil:
+    visible: "Join an existing space.*"
+    timeout: 30000
+- tapOn: "Join an existing space.*"
+- inputText: ${INVITATION_CODE}
+- tapOn:
+    text: "Continue"
+    optional: true
+- tapOn: "Space password"
+- inputText: ${SPACE_PASSWORD}
+- scrollUntilVisible:
+    element:
+      text: "Join"
+    direction: DOWN
+- tapOn: "Join"

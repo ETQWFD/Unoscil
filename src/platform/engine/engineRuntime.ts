@@ -1,0 +1,469 @@
+import { recordHistoryLatency } from '@/support/diagnostics/historyLatency';
+import { OutboundProgressProjection } from "./outboundProgressProjection";
+import type { Device, OutboundProgress } from "./contracts";
+import NetInfo from '@react-native-community/netinfo';
+import type {
+  EngineConfig,
+  EngineEvent,
+  PeerConnectionRefresh,
+  ConnectivityOpportunity,
+} from './contracts';
+import { AppState } from 'react-native';
+import type { RejectedConfigImport } from './contracts';
+import { createLogger } from '@/support/observability';
+import {
+  createInitialUnifiedEngineSnapshot,
+  publishUnifiedEngineSnapshot,
+  type PeerConnectionStatus,
+  type UnifiedEngineSnapshot,
+} from '@/stores/unifiedEngineStore';
+
+const log = createLogger('UnifiedEngineService');
+
+export interface UnifiedEngineApi {
+  listOutboundProgress(): Promise<OutboundProgress[]>;
+  listDevices(): Promise<Device[]>;
+  start(config: EngineConfig): Promise<void>;
+  queryRejectedConfigImport(): Promise<RejectedConfigImport | null>;
+  shutdown(deadlineMs?: number): Promise<void>;
+  shutdownUntilComplete(): Promise<void>;
+  resume(): Promise<void>;
+  setBackgroundSyncEnabled(enabled: boolean, appIsBackground: boolean): Promise<void>;
+  nextEvent(timeoutMs?: number): Promise<EngineEvent | null>;
+  refreshPeerConnections(): Promise<PeerConnectionRefresh>;
+  notifyConnectivityOpportunity(reason: ConnectivityOpportunity): Promise<void>;
+}
+
+type SnapshotPublisher = (snapshot: UnifiedEngineSnapshot) => void;
+type EngineEventSubscriber = (event: EngineEvent) => void;
+
+const DEFAULT_EVENT_TIMEOUT_MS = 250;
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class UnifiedEngineService {
+  private snapshot = createInitialUnifiedEngineSnapshot();
+  private readonly outbound: OutboundProgressProjection;
+  private generation = 0;
+  private nativeStarted = false;
+  private nativeHandleExists = false;
+  private startInFlight: Promise<void> | null = null;
+  private eventLoop: Promise<void> | null = null;
+  private configImportQuery: Promise<void> | null = null;
+  private networkUnsubscribe: (() => void) | null = null;
+  private readonly eventSubscribers = new Set<EngineEventSubscriber>();
+
+  constructor(
+    private readonly api: UnifiedEngineApi,
+    private readonly publish: SnapshotPublisher = publishUnifiedEngineSnapshot,
+    private readonly eventTimeoutMs = DEFAULT_EVENT_TIMEOUT_MS
+  ) {
+    this.outbound = new OutboundProgressProjection(
+      () => this.api.listOutboundProgress(),
+      (outbound) => {
+        if (this.nativeStarted) this.updateSnapshot({ outbound });
+      },
+    );
+    this.publishSnapshot();
+  }
+
+  listDevices(): Promise<Device[]> {
+    return this.api.listDevices();
+  }
+  listOutboundProgress(): Promise<OutboundProgress[]> {
+    return this.api.listOutboundProgress();
+  }
+  refreshOutboundProgress(): Promise<void> {
+    return this.outbound.refresh();
+  }
+
+  start(config: EngineConfig): Promise<void> {
+    if (this.nativeStarted) return Promise.resolve();
+    if (this.startInFlight) return this.startInFlight;
+
+    const generation = ++this.generation;
+    this.outbound.reset();
+    this.configImportQuery = null;
+    this.snapshot = {
+      ...createInitialUnifiedEngineSnapshot(),
+      status: 'starting',
+    };
+    this.publishSnapshot();
+
+    const attempt = this.startNative(config, generation);
+    this.startInFlight = attempt;
+    void attempt.then(
+      () => this.clearStartInFlight(attempt),
+      () => this.clearStartInFlight(attempt)
+    );
+    return attempt;
+  }
+
+  isStarting(): boolean {
+    return this.startInFlight !== null;
+  }
+
+  refreshPeerConnections(): Promise<PeerConnectionRefresh> {
+    const generation = this.generation;
+    this.updatePeerConnectionStatus('connecting');
+    return this.api.refreshPeerConnections().then(
+      (report) => {
+        if (generation !== this.generation || !this.nativeStarted) return report;
+        this.updatePeerConnectionStatus(report.online > 0 ? 'online' : 'offline');
+        if (report.online > 0) {
+          log.info(
+            `peer connections online total=${report.total} online=${
+              report.online
+            } (relay configuration is owned and logged by the engine)`,
+          );
+        }
+        return report;
+      },
+      (error) => {
+        if (generation === this.generation && this.nativeStarted)
+          this.updatePeerConnectionStatus("offline");
+        throw error;
+      },
+    );
+  }
+
+  async notifyConnectivityOpportunity(
+    reason: ConnectivityOpportunity,
+  ): Promise<void> {
+    if (!this.nativeStarted) return;
+    try {
+      await this.api.notifyConnectivityOpportunity(reason);
+    } finally {
+      // Android also resumes natively. Refresh after the foreground recovery path.
+      if (reason === "foreground") await this.refreshRejectedConfigImport();
+      await this.refreshOutboundProgress();
+    }
+  }
+
+  async resume(): Promise<void> {
+    if (!this.nativeStarted) return;
+    await this.api.resume();
+    await this.refreshRejectedConfigImport();
+    await this.refreshOutboundProgress();
+  }
+
+  refreshRejectedConfigImport(): Promise<void> {
+    if (!this.nativeStarted) return Promise.resolve();
+    if (this.configImportQuery) return this.configImportQuery;
+    const generation = this.generation;
+    const query = this.queryRejectedConfigImport(generation);
+    this.configImportQuery = query;
+    void query.finally(() => {
+      if (this.configImportQuery === query) this.configImportQuery = null;
+    });
+    return query;
+  }
+
+  private async queryRejectedConfigImport(generation: number): Promise<void> {
+    try {
+      const rejection = await this.api.queryRejectedConfigImport();
+      if (generation !== this.generation || !this.nativeStarted) return;
+      this.updateSnapshot({
+        configImportStatus: { kind: "checked", rejection },
+      });
+    } catch (error) {
+      if (generation !== this.generation || !this.nativeStarted) return;
+      const failure =
+        error !== null &&
+        typeof error === "object" &&
+        "code" in error &&
+        typeof error.code === "number" &&
+        "category" in error &&
+        typeof error.category === "string" &&
+        "retryable" in error &&
+        typeof error.retryable === "boolean"
+          ? {
+              code: error.code,
+              category: error.category,
+              retryable: error.retryable,
+            }
+          : null;
+      this.updateSnapshot({
+        configImportStatus: { kind: "unavailable", failure },
+      });
+      log.warn("Failed to query rejected configuration import status", failure);
+    }
+  }
+
+  setBackgroundSyncPolicy(enabled: boolean): Promise<void> {
+    if (!this.nativeStarted) return Promise.resolve();
+    return this.api.setBackgroundSyncEnabled(
+      enabled,
+      AppState.currentState !== "active",
+    );
+  }
+
+  subscribeEvents(subscriber: EngineEventSubscriber): () => void {
+    this.eventSubscribers.add(subscriber);
+    return () => this.eventSubscribers.delete(subscriber);
+  }
+
+  async stop(): Promise<void> {
+    this.networkUnsubscribe?.();
+    this.networkUnsubscribe = null;
+    ++this.generation;
+    this.outbound.reset();
+
+    const startInFlight = this.startInFlight;
+    let shutdownError: unknown;
+
+    if (startInFlight || this.nativeHandleExists) {
+      this.nativeStarted = false;
+      try {
+        await this.shutdownCompletely();
+      } catch (error) {
+        shutdownError = error;
+      }
+    }
+
+    if (startInFlight) {
+      try {
+        await startInFlight;
+      } catch {
+        // The failed start already published its terminal state.
+      }
+
+      // Cover the narrow window where shutdown arrived before the native
+      // engine became visible to the module.
+      try {
+        await this.shutdownCompletely();
+      } catch (error) {
+        shutdownError ??= error;
+      }
+    }
+
+    const eventLoop = this.eventLoop;
+    this.eventLoop = null;
+    await eventLoop;
+
+    if (shutdownError) {
+      const message = errorMessage(shutdownError);
+      this.updateSnapshot({
+        status: "failed",
+        isStarted: false,
+        lastError: message,
+      });
+      log.error("Failed to stop the P2P engine:", shutdownError);
+      throw shutdownError;
+    }
+
+    this.snapshot = createInitialUnifiedEngineSnapshot();
+    this.publishSnapshot();
+  }
+
+  private async shutdownCompletely(): Promise<void> {
+    await this.api.shutdownUntilComplete();
+    this.nativeHandleExists = false;
+  }
+
+  private async startNative(
+    config: EngineConfig,
+    generation: number,
+  ): Promise<void> {
+    try {
+      // A stopped runtime still owns a native module handle until shutdown releases it.
+      if (this.nativeHandleExists) await this.shutdownCompletely();
+      await this.api.start(config);
+      this.nativeHandleExists = true;
+      if (generation !== this.generation) return;
+
+      this.nativeStarted = true;
+      this.networkUnsubscribe = NetInfo.addEventListener(() => {
+        void this.notifyConnectivityOpportunity("network_changed").catch(() => {
+          log.warn("Failed to report a network connectivity opportunity");
+        });
+      });
+      this.updateSnapshot({
+        status: "running",
+        isStarted: true,
+        lastError: null,
+      });
+      await this.refreshRejectedConfigImport();
+      await this.refreshOutboundProgress();
+      if (generation !== this.generation) return;
+      const eventLoop = this.consumeEvents(generation);
+      this.eventLoop = eventLoop;
+      void eventLoop.then(
+        () => this.clearEventLoop(eventLoop),
+        () => this.clearEventLoop(eventLoop),
+      );
+    } catch (error) {
+      if (generation === this.generation) {
+        const message = errorMessage(error);
+        this.updateSnapshot({
+          status: "failed",
+          isStarted: false,
+          lastError: message,
+        });
+        log.error("Failed to start the P2P engine:", error);
+      }
+      throw error;
+    }
+  }
+
+  private async consumeEvents(generation: number): Promise<void> {
+    while (generation === this.generation && this.nativeStarted) {
+      let event: EngineEvent | null;
+      try {
+        event = await this.api.nextEvent(this.eventTimeoutMs);
+      } catch (error) {
+        if (generation !== this.generation) return;
+        const message = errorMessage(error);
+        this.updateSnapshot({ status: "failed", lastError: message });
+        log.error("Failed to read a P2P engine event:", error);
+        return;
+      }
+
+      if (generation !== this.generation || !event) continue;
+      this.applyEvent(event);
+      if (event.type === "fatal") return;
+    }
+  }
+
+  private applyEvent(event: EngineEvent): void {
+    if (event.type === 'incomingEntry' || event.type === 'incomingPending' ||
+        event.type === 'receiveAttemptStateChanged' || event.type === 'activeClipboardChanged') {
+      recordHistoryLatency('engine_event_js', undefined, {
+        outcome: 'observed', eventType: event.type, entryId: event.entryId,
+        attemptId: 'attemptId' in event ? event.attemptId : null,
+        nativeReturnedAtMs: event.diagnosticNativeReturnedAtMs,
+        nativeUptimeMs: event.diagnosticNativeUptimeMs,
+      });
+    }
+    if (
+      event.type === "outboundProgressChanged" ||
+      event.type === "refreshRequired" ||
+      (event.type === "stateChanged" && event.state === "running") ||
+      (event.type === "peerPresenceChanged" && event.state === "online")
+    ) {
+      void this.refreshOutboundProgress();
+    }
+    for (const subscriber of this.eventSubscribers) {
+      try {
+        subscriber(event);
+      } catch (error) {
+        log.error("A P2P event subscriber failed:", error);
+      }
+    }
+
+    switch (event.type) {
+      case "stateChanged":
+        if (event.state === "stopped") {
+          this.nativeStarted = false;
+          this.networkUnsubscribe?.();
+          this.networkUnsubscribe = null;
+        }
+        this.updateSnapshot({
+          status: event.state,
+          isStarted: event.state !== "stopped",
+          lastEvent: event,
+        });
+        break;
+      case "refreshRequired":
+        this.updateSnapshot({
+          lastEvent: event,
+          refreshRevision: this.snapshot.refreshRevision + 1,
+        });
+        break;
+      case "changed":
+        this.updateSnapshot({ lastEvent: event, lastChangedKind: event.kind });
+        break;
+      case "outboundProgressChanged":
+      case "receiveProgressChanged":
+      case "incomingEntry":
+      case "incomingPending":
+      case "receiveAttemptStateChanged":
+      case "deliveryStatusChanged":
+      case "transferStatusChanged":
+      case "activeClipboardChanged":
+      case "deviceTrustChanged":
+      case "rePairingRequired":
+      case "networkRecoveryChanged":
+        this.updateSnapshot({
+          lastEvent: event,
+          lastChangedKind: event.type,
+          refreshRevision: this.snapshot.refreshRevision + 1,
+        });
+        break;
+      case "peerPresenceChanged":
+        this.updateSnapshot({
+          lastEvent: event,
+          lastChangedKind: event.type,
+          ...(event.state === "online"
+            ? { peerConnectionStatus: "online" as const }
+            : {}),
+          refreshRevision: this.snapshot.refreshRevision + 1,
+        });
+        break;
+      case "transferProgress":
+        this.updateSnapshot({ lastEvent: event, lastChangedKind: event.type });
+        break;
+      case "fatal":
+        this.updateSnapshot({
+          status: "failed",
+          lastEvent: event,
+          fatalFailure: event.failure,
+        });
+        log.error("The P2P engine reported a fatal failure:", event.failure);
+        break;
+      case "lifecycleFailed":
+        this.updateSnapshot({
+          lastEvent: event,
+          lifecycleFailure: { action: event.action, failure: event.failure },
+        });
+        log.error(`The P2P engine failed to ${event.action}:`, event.failure);
+        break;
+      case "operationFinished":
+        this.updateSnapshot({ lastEvent: event });
+        break;
+    }
+  }
+
+  private updateSnapshot(updates: Partial<UnifiedEngineSnapshot>): void {
+    this.snapshot = { ...this.snapshot, ...updates };
+    this.publishSnapshot();
+  }
+
+  private updatePeerConnectionStatus(status: PeerConnectionStatus): void {
+    if (this.snapshot.peerConnectionStatus !== status) {
+      this.updateSnapshot({ peerConnectionStatus: status });
+    }
+  }
+
+  private publishSnapshot(): void {
+    this.publish({ ...this.snapshot });
+  }
+
+  private clearStartInFlight(attempt: Promise<void>): void {
+    if (this.startInFlight === attempt) this.startInFlight = null;
+  }
+
+  private clearEventLoop(eventLoop: Promise<void>): void {
+    if (this.eventLoop === eventLoop) this.eventLoop = null;
+  }
+}
+
+let sharedService: UnifiedEngineService | null = null;
+let sharedApi: UnifiedEngineApi | null = null;
+
+export function configureUnifiedEngineService(api: UnifiedEngineApi): void {
+  if (sharedService) {
+    throw new Error("The unified engine service has already been created");
+  }
+  sharedApi = api;
+}
+
+export function getUnifiedEngineService(): UnifiedEngineService {
+  if (!sharedService) {
+    if (!sharedApi)
+      throw new Error("The unified engine service is not configured");
+    sharedService = new UnifiedEngineService(sharedApi);
+  }
+  return sharedService;
+}

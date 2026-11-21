@@ -1,0 +1,1162 @@
+import type {
+  EngineCaptureStatus,
+  EngineDiagnosticStatus,
+  EngineDiagnosticExportReport,
+  NetworkLogResult,
+  NetworkLogStatus,
+  NetworkLogCaptureStatus,
+  NetworkLogExport,
+} from './diagnostics';
+export type {
+  EngineCaptureStatus,
+  EngineDiagnosticStatus,
+  EngineDiagnosticExportReport,
+  NetworkLogResult,
+  NetworkLogStatus,
+  NetworkLogCaptureStatus,
+  NetworkLogExport,
+  NetworkLogExportFile,
+  NetworkLogError,
+  NetworkLogCounters,
+} from './diagnostics';
+export type ConnectivityOpportunity =
+  | 'foreground'
+  | 'system_wake'
+  | 'network_changed';
+import { Platform } from 'react-native';
+import { requireNativeModule } from 'expo-modules-core';
+
+export interface EngineConfig {
+  appVersion: string;
+  profileId: string;
+}
+
+export interface RelaySaveResult {
+  configured: boolean;
+}
+
+export interface CustomRelay {
+  url: string;
+  credentialConfigured: boolean;
+}
+
+export type CustomRelayMutationRejection = 'invalidUrl' | 'duplicate' | 'notFound';
+
+export interface CustomRelayMutationResult {
+  relays: CustomRelay[];
+  rejection?: CustomRelayMutationRejection;
+}
+
+export type RelayRoutingMode = 'builtIn' | 'custom' | 'disabled';
+
+export interface RelayOverviewEntry {
+  source: 'builtIn' | 'custom';
+  /** Built-in entries only; unknown future ids must fall back to showing the URL. */
+  regionId?: string | null;
+  url: string;
+  credentialConfigured: boolean;
+  /** The running node is configured with this relay. It is not a connectivity claim. */
+  inEffect: boolean;
+}
+
+export interface RelayOverview {
+  savedMode: RelayRoutingMode;
+  /** Absent until the network node has been built. */
+  appliedMode?: RelayRoutingMode | null;
+  changePending: boolean;
+  entries: RelayOverviewEntry[];
+}
+
+export type EngineState =
+  | 'running'
+  | 'quiescing'
+  | 'quiesced'
+  | 'suspended'
+  | 'shuttingDown'
+  | 'stopped';
+
+export interface SpaceCreated {
+  spaceId: string;
+  selfDeviceId: string;
+  identityFingerprint: string;
+}
+
+export interface InvitationIssued {
+  invitationCode: string;
+  fullInvitation: string;
+  expiresAtMs: number;
+  availability: 'crossNetwork' | 'sameLocalNetwork';
+}
+
+export interface JoinedSpace {
+  peerUpgradeRequired?: boolean;
+  sponsorDeviceId: string;
+  sponsorIdentityFingerprint: string;
+  spaceId: string;
+  selfDeviceId: string;
+  selfIdentityFingerprint: string;
+  migratedRecords: number;
+  preservedUnreadableRecords: number;
+}
+
+export type JoinSpaceRejectionReason =
+  | 'invitationUnavailable'
+  | 'authenticationRejected'
+  | 'identityConflict'
+  | 'baseHistoryChanged'
+  | 'joinerHistoryAhead'
+  | 'historyConflict'
+  | 'completionInvalid'
+  | 'membershipHistoryInvalid'
+  | 'securityMaterialInvalid'
+  | 'relationshipConflict'
+  | 'activationStateInvalid'
+  | 'peerUpgradeRequired'
+  | 'sponsorUnresponsive'
+  | 'cancelled'
+  | 'removedBeforeActivation';
+
+export type JoinSpaceTerminationReason = 'cancelled' | 'expired' | 'superseded';
+
+export type JoinSpaceAttentionReason = 'outcomeCannotBeProven' | 'continuationUnavailable';
+export type JoinSpaceAttentionRecovery =
+  | 'preserveDataAndContactSupport'
+  | 'restartWithNewInvitation';
+
+export type JoinSpaceStatus =
+  | {
+      type: 'active';
+      joinId: string;
+      joinedSpace: JoinedSpace;
+      peerUpgradeRequired: boolean;
+    }
+  | {
+      type: 'pending';
+      joinId: string;
+      targetSpaceId: string | null;
+      sponsorDeviceId: string | null;
+      sponsorIdentityFingerprint: string | null;
+      cancelRequested: boolean;
+      peerUpgradeRequired: boolean;
+    }
+  | {
+      type: 'processing';
+      joinId: string;
+      targetSpaceId: string;
+      sponsorDeviceId: string;
+      sponsorIdentityFingerprint: string;
+      peerUpgradeRequired: boolean;
+    }
+  | {
+      type: 'needsAttention';
+      joinId: string;
+      reason: JoinSpaceAttentionReason;
+      recovery: JoinSpaceAttentionRecovery;
+      nextRetryAtMs: number | null;
+    }
+  | { type: 'rejected'; joinId: string; reason: JoinSpaceRejectionReason }
+  | { type: 'terminated'; joinId: string; reason: JoinSpaceTerminationReason };
+
+export interface SendReport {
+  entryId: string;
+  atMs: number;
+  totalAccepted: number;
+  totalDuplicate: number;
+  totalOffline: number;
+  totalErrored: number;
+  totalPending: number;
+}
+
+export interface PeerConnectionRefresh {
+  total: number;
+  online: number;
+  offline: number;
+  errors: number;
+}
+
+export interface SpaceInvitation {
+  invitationCode: string;
+  fullInvitation: string;
+  expiresAtMs: number;
+}
+
+export interface SpaceState {
+  hasCompleted: boolean;
+  rePairingRequired: boolean;
+  spaceId: string | null;
+  currentInvitation: SpaceInvitation | null;
+  deviceName: string | null;
+}
+
+export interface Device {
+  deviceId: string;
+  displayName: string;
+  isLocal: boolean;
+  online: boolean;
+}
+
+export type WorkspaceConvergencePhase =
+  | 'locallyApplied'
+  | 'converging'
+  | 'complete'
+  | 'recoveryRequired';
+
+export type WorkspaceConvergenceFailureCategory =
+  | 'spaceMismatch'
+  | 'continuityGap'
+  | 'identityMismatch'
+  | 'digestConflict'
+  | 'unauthorized'
+  | 'versionIncompatible'
+  | 'noEffectiveMembers'
+  | 'storage';
+
+export interface WorkspaceConvergence {
+  phase: WorkspaceConvergencePhase;
+  revision: number;
+  historyEventCount: number;
+  effectiveMemberCount: number;
+  pendingRemovalDecisionDeviceIds: string[];
+  pendingRemovalDecisionEventId: string | null;
+  divergedPeerDeviceIds: string[];
+  upgradeRequiredPeerDeviceIds: string[];
+  convergenceDigest: string | null;
+  removed: boolean;
+  updatedAtMs: number;
+  failureCategory: WorkspaceConvergenceFailureCategory | null;
+}
+
+export type SpaceDeviceUpdatePhase =
+  | 'updating'
+  | 'completed'
+  | 'retryableFailure'
+  | 'needsAttention';
+
+export type SpaceDeviceUpdateProblem =
+  | 'deviceStateRejected'
+  | 'deviceRelationshipConflict'
+  | 'deviceSecurityUpdateRejected'
+  | 'deviceUpgradeRequired'
+  | 'localIdentityMismatch';
+
+export type SpaceDeviceUpdateRecovery = 'reviewDevices' | 'updateApp';
+
+export type DeviceTrustChoice = string;
+
+export type DeviceTrustQueryResult =
+  | { ok: true; value: string }
+  | {
+      ok: false;
+      failure: { code: number; category: string; retryable: boolean };
+    };
+
+/** Exact unsigned 64-bit value at the native boundary. Never convert to Number. */
+export type EngineU64 = string;
+export type OutboundProgressState =
+  | "waiting"
+  | "transferring"
+  | "processing"
+  | "retrying"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "unconfirmed";
+export type OutboundProgressBatchState =
+  | "no_items"
+  | "waiting"
+  | "in_progress"
+  | "unconfirmed"
+  | "partially_unconfirmed"
+  | "completed"
+  | "failed"
+  | "partially_failed"
+  | "cancelled"
+  | "partially_cancelled";
+export type OutboundReconciliation =
+  | "running"
+  | "settled"
+  | "superseded"
+  | "not_retained"
+  | "unsupported"
+  | "unreachable"
+  | "busy";
+export interface OutboundProgressItem {
+  kind: ReceiveItemKind;
+  index: number;
+  state: OutboundProgressState;
+  lastKnownPhase: "waiting" | "transferring" | "processing" | "retrying" | null;
+  round: number | null;
+  completedBytes: EngineU64 | null;
+  totalBytes: EngineU64 | null;
+  failureReason: string | null;
+  cancellationReason: string | null;
+}
+export interface OutboundProgress {
+  entryId: string;
+  targetDeviceId: string;
+  attemptId: string | null;
+  revision: EngineU64;
+  freshness: "waiting" | "live" | "unconfirmed" | "settled";
+  freshnessAvailable: boolean;
+  state: OutboundProgressBatchState;
+  itemsTotal: number;
+  itemsWaiting: number;
+  itemsRunning: number;
+  itemsCompleted: number;
+  itemsFailed: number;
+  itemsCancelled: number;
+  itemsUnconfirmed: number;
+  items: OutboundProgressItem[];
+}
+export interface ResendTargetProgress {
+  targetDeviceId: string;
+  state: OutboundReconciliation;
+  current: OutboundProgress | null;
+  newTransferRequested: boolean;
+  duplicateFilesPossible: boolean;
+}
+
+export type ResendEntryOutcome =
+  | {
+      kind: 'completed';
+      reconciled: ResendTargetProgress[];
+      accepted: number;
+      duplicate: number;
+      offline: number;
+      errored: number;
+      pending: number;
+    }
+  | { kind: 'synchronizationDisabled' }
+  | { kind: 'entryNotFound'; entryId: string }
+  | {
+      kind: 'entryNotResendable';
+      entryId: string;
+      reason: 'remoteOrigin' | 'payloadLost';
+    }
+  | { kind: 'targetNotTrusted'; deviceId: string }
+  | { kind: 'noEligibleTargets' };
+
+/** Receiver-side item kinds. A directory is one selectable `directory_unit`. */
+export type ReceiveItemKind = 'file' | 'representation' | 'directory_unit';
+
+/**
+ * One independently settled receive item. `state`, `kind` and `failureReason` are the
+ * Engine's wire strings, passed through unchanged so a newer Engine value is preserved.
+ */
+export interface ReceiveItem {
+  itemId: string;
+  kind: ReceiveItemKind | (string & {});
+  state: string;
+  failureReason: string | null;
+}
+
+/**
+ * Snapshot of the current receive attempt for one entry. `completedBytes` counts
+ * delivered member bytes only. `itemsTotal` counts members, which can exceed
+ * `items.length` for a directory.
+ */
+export interface ReceiveProgress {
+  entryId: string;
+  attemptId: string;
+  state: string;
+  totalBytes: number;
+  completedBytes: number;
+  itemsTotal: number;
+  itemsCompleted: number;
+  items: ReceiveItem[];
+}
+
+export type ReceiveRetryUnavailableReason = 'source_unavailable' | 'access_denied';
+
+/** `accepted` only means the Engine took a new attempt; it is not a saved file. */
+export type ReceiveRetryOutcome =
+  | { kind: 'accepted'; attemptId: string }
+  | { kind: 'alreadyReceiving' }
+  | { kind: 'superseded' }
+  | { kind: 'cancellationIncomplete' }
+  | { kind: 'unavailable'; reason: ReceiveRetryUnavailableReason | (string & {}) };
+
+/** `cancellation_incomplete` means cleanup is still running; it is not a cancelled state. */
+export type EntryReceiveCancellation =
+  | 'cancelled'
+  | 'cancellation_incomplete'
+  | 'not_receiving'
+  | 'too_late'
+  | 'already_terminal'
+  | 'superseded'
+  | (string & {});
+
+/** Native bridge return time is a boundary observation, not Engine event emission time. */
+export type EngineEvent = EngineEventPayload & {
+  diagnosticNativeReturnedAtMs?: number;
+  diagnosticNativeUptimeMs?: number;
+};
+
+type EngineEventPayload =
+  | { type: 'stateChanged'; state: EngineState }
+  | {
+      type: 'operationFinished';
+      operationId: string;
+      terminal: string;
+      failure: { code: number; category: string; retryable: boolean } | null;
+    }
+  | {
+      type: 'lifecycleFailed';
+      action: 'suspend' | 'resume';
+      failure: { code: number; category: string; retryable: boolean };
+    }
+  | { type: 'refreshRequired'; reason: string }
+  | {
+      type: 'fatal';
+      failure: { code: number; category: string; retryable: boolean };
+    }
+  | {
+      type: 'incomingEntry';
+      entryId: string;
+      attemptId: string | null;
+      preview: string;
+      origin: 'local' | 'remote';
+    }
+  | {
+      type: 'incomingPending';
+      entryId: string;
+      attemptId: string | null;
+      fromDevice: string;
+      totalBytes: number | null;
+      filenames: string[];
+    }
+  | {
+      type: 'receiveAttemptStateChanged';
+      entryId: string;
+      attemptId: string;
+      state: string;
+    }
+  | { type: 'outboundProgressChanged' }
+  | { type: 'receiveProgressChanged' }
+  | { type: 'deliveryStatusChanged'; entryId: string; targetDeviceId: string }
+  | {
+      type: 'peerPresenceChanged';
+      deviceId: string;
+      state: string;
+      atMs: number;
+    }
+  | {
+      type: 'transferProgress';
+      transferId: string;
+      entryId: string | null;
+      attemptId: string | null;
+      peerId: string;
+      direction: 'sending' | 'receiving';
+      completedBytes: number;
+      totalBytes: number | null;
+    }
+  | {
+      type: 'transferStatusChanged';
+      transferId: string;
+      entryId: string;
+      attemptId: string | null;
+      status: string;
+      reason: string | null;
+    }
+  | {
+      type: 'activeClipboardChanged';
+      snapshotHash: string;
+      entryId: string;
+      activatedAtMs: number;
+      activatedBy: string;
+    }
+  | { type: 'deviceTrustChanged'; revision: number }
+  | { type: 'rePairingRequired'; scope: 'allDevices' }
+  | {
+      type: 'networkRecoveryChanged';
+      phase: string;
+      retryable: boolean;
+      nextRetryInMs: number | null;
+    }
+  | { type: 'changed'; kind: string };
+
+export type ClipboardRestoreMode = 'standard' | 'plainText' | 'filePaths';
+export type ClipboardRestoreOutcome =
+  | 'restored'
+  | 'payloadUnavailable'
+  | 'notApplicable';
+
+export interface AnalyticsState {
+  projectKey: string;
+  consentEnabled: boolean;
+  distinctId: string;
+  anonymousId: string;
+  deviceId: string;
+  spaceGroupKey: string | null;
+  isIdentified: boolean;
+}
+
+export interface EngineLogStatus {
+  localFile: 'disabled' | 'ready' | 'unavailable';
+  droppedLocalRecords: number | null;
+  installation: {
+    localFile: 'disabled' | 'ready' | 'unavailable';
+    droppedLocalRecords: number;
+  } | null;
+}
+
+export interface NativeDiagnosticsSnapshot {
+  discoveryStatus?: 'completed' | 'partial' | 'unavailable';
+  skippedFileCount?: number;
+  flushStatus: 'completed' | 'incomplete';
+  fileUris: string[];
+  writer: {
+    writerStatus: 'ready' | 'unavailable';
+    policy: string;
+    effectiveLevel: 'info';
+    droppedRecords: number;
+    writeFailures: number;
+    prunedFiles: number;
+    sessionId: string;
+    role: 'main' | 'keyboard' | 'share';
+    startedAt: string;
+    capturedAt: string;
+    retentionDays: number;
+    maxFileBytes: number;
+    maxFiles: number;
+  };
+}
+
+/** Android only. See docs/specs/006-android-power-metrics.md. */
+export interface PowerMetricsSnapshot {
+  flushStatus: 'completed' | 'incomplete';
+  /** Local `file://` URI of the raw sample file, or null when nothing has been written. */
+  fileUri: string | null;
+  sampleCount: number;
+  droppedSamples: number;
+  writeFailures: number;
+  maxSamples: number;
+  retentionDays: number;
+  /** Per-source availability decided from real reads: `ok`, `unsupported`, `denied`, or `error`. */
+  sources: Record<string, 'ok' | 'unsupported' | 'denied' | 'error'>;
+  device: { sdk: number; manufacturer: string; model: string };
+  policy: string;
+}
+
+/**
+ * iOS background transition for host-owned App Group files. `suspend` asks the
+ * host to close them before the process may be suspended; `resume` follows the
+ * next foreground. `transitionId` identifies the background transition.
+ */
+export interface HostSuspensionEvent {
+  phase: 'suspend' | 'resume';
+  transitionId: number;
+}
+
+export type ConfigImportRejectionReason =
+  | 'unsupportedFormat'
+  | 'malformedMarker'
+  | 'missingRuntimeMembers';
+
+export interface RejectedConfigImport {
+  reason: ConfigImportRejectionReason;
+  message: string;
+}
+
+interface UcEngineNativeModule {
+  addListener?(
+    eventName: 'onHostSuspension',
+    listener: (event: HostSuspensionEvent) => void
+  ): { remove(): void };
+  completeHostSuspension?(transitionId: number, released: boolean): Promise<void>;
+  getPowerMetrics?(): Promise<PowerMetricsSnapshot>;
+  resetPowerMetrics?(): Promise<boolean>;
+  startEngineDiagnosticCapture(
+    durationMs: number
+  ): Promise<EngineCaptureStatus>;
+  stopEngineDiagnosticCapture(
+    captureId: string
+  ): Promise<'stopped' | 'alreadyStopped' | 'differentCapture'>;
+  getEngineDiagnosticStatus(): Promise<EngineDiagnosticStatus>;
+  prepareEngineDiagnosticExport(): Promise<EngineDiagnosticExportReport>;
+  getNativeDiagnostics(): Promise<NativeDiagnosticsSnapshot>;
+  flushEngineLogs(): Promise<boolean>;
+  getEngineLogStatus(): Promise<EngineLogStatus>;
+  getNetworkLogStatus?(): Promise<NetworkLogResult<NetworkLogStatus>>;
+  startNetworkLogCapture?(durationMs: number): Promise<NetworkLogResult<NetworkLogCaptureStatus>>;
+  stopNetworkLogCapture?(captureId: string): Promise<NetworkLogResult<Record<string, never>>>;
+  prepareNetworkLogExport?(): Promise<NetworkLogResult<NetworkLogExport>>;
+  releaseNetworkLogExport?(exportId: string): Promise<void>;
+  coreVersion(): string;
+  start(config: EngineConfig): Promise<void>;
+  saveCustomRelayNode(
+    url: string,
+    accessToken: string,
+    previousUrl?: string
+  ): Promise<RelaySaveResult>;
+  queryRejectedConfigImport(): Promise<EngineCallResult<{ rejection: RejectedConfigImport | null }>>;
+  queryCustomRelays(): Promise<CustomRelay[]>;
+  queryRelayOverview(): Promise<RelayOverview>;
+  addCustomRelay(url: string, accessToken: string): Promise<CustomRelayMutationResult>;
+  editCustomRelay(
+    previousUrl: string,
+    url: string,
+    accessToken: string
+  ): Promise<CustomRelayMutationResult>;
+  deleteCustomRelay(url: string): Promise<CustomRelayMutationResult>;
+  shutdown(deadlineMs: number): Promise<void>;
+  shutdownUntilComplete(): Promise<void>;
+  suspend(): Promise<void>;
+  resume(): Promise<void>;
+  setBackgroundSyncEnabled(
+    enabled: boolean,
+    appIsBackground: boolean
+  ): Promise<void>;
+  getAnalyticsConsent(): Promise<boolean>;
+  getAnalyticsState(): Promise<AnalyticsState>;
+  setAnalyticsConsent(enabled: boolean): Promise<void>;
+  resetAnalyticsIdentity(): Promise<void>;
+  createSpace(
+    deviceName: string | null,
+    passphrase: string
+  ): Promise<EngineCallResult<SpaceCreated>>;
+  issueInvitation(): Promise<EngineCallResult<InvitationIssued>>;
+  joinSpace(
+    invitationCode: string,
+    deviceName: string | null,
+    passphrase: string,
+    preserveUnreadableHistory: boolean
+  ): Promise<EngineCallResult<JoinSpaceStatus>>;
+  cancelJoinSpace(joinId: string): Promise<void>;
+  nextEvent(timeoutMs: number): Promise<EngineEvent | null>;
+  refreshPeerConnections(): Promise<PeerConnectionRefresh>;
+  notifyConnectivityOpportunity(reason: ConnectivityOpportunity): Promise<void>;
+  querySpaceState(): Promise<SpaceState>;
+  listDevices(): Promise<Device[]>;
+  queryDeviceGroupChoices(): Promise<DeviceTrustQueryResult>;
+  chooseDeviceGroup(
+    issueId: string,
+    choiceId: string,
+    expectedRevision: number,
+    confirmLocalRemoval: boolean
+  ): Promise<string>;
+  removeMember(deviceId: string): Promise<WorkspaceConvergence>;
+  resendEntry(
+    entryId: string,
+    targetDevices: string[],
+    confirmNewTransfer: boolean,
+  ): Promise<EngineCallResult<ResendEntryOutcome>>;
+  queryOutboundProgress(
+    entryId: string,
+    targetDeviceId: string,
+  ): Promise<EngineCallResult<{ progress: OutboundProgress | null }>>;
+  listOutboundProgress(): Promise<
+    EngineCallResult<{ progress: OutboundProgress[] }>
+  >;
+  reconcileOutboundProgress(
+    entryId: string,
+    targetDeviceId: string,
+    expectedAttemptId: string | null,
+  ): Promise<EngineCallResult<{ state: OutboundReconciliation }>>;
+  leaveSpace(): Promise<void>;
+  sendText(text: string, targetDevices: string[]): Promise<SendReport>;
+  sendImage(
+    bytes: Uint8Array,
+    mimeType: string,
+    targetDevices: string[]
+  ): Promise<SendReport>;
+  registerInputFile(uri: string, displayName: string | null): string;
+  registerOutputFile(uri: string): string;
+  releaseFileHandle(handle: string): void;
+  sendFiles(
+    fileHandles: string[],
+    targetDevices: string[]
+  ): Promise<SendReport>;
+  captureCurrentClipboard(): Promise<string | null>;
+  observeClipboardChange(
+    dispatch: boolean,
+    captured?: CapturedClipboard | null
+  ): Promise<SendReport | null>;
+  restoreClipboard(
+    entryId: string,
+    mode: ClipboardRestoreMode
+  ): Promise<ClipboardRestoreOutcome>;
+  exportEntry(entryId: string, destinationHandle: string): Promise<void>;
+  queryEntryReceiveProgress(entryId: string): Promise<ReceiveProgress | null>;
+  listEntryReceiveProgress(): Promise<ReceiveProgress[]>;
+  retryEntryReceive(
+    entryId: string,
+    expectedAttemptId: string,
+    itemIds: string[]
+  ): Promise<EngineCallResult<ReceiveRetryOutcome>>;
+  cancelEntryReceive(entryId: string, attemptId: string): Promise<EntryReceiveCancellation>;
+}
+
+const NativeModule = requireNativeModule<UcEngineNativeModule>('UcEngine');
+
+export interface EngineFailure {
+  code: number;
+  category: string;
+  retryable: boolean;
+}
+
+/**
+ * Native space operations report an Engine failure as data, because the Expo
+ * bridge only carries a message string. Hosts must read `code`, `category` and
+ * `retryable` from here instead of parsing the message.
+ */
+export type EngineCallResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; failure: EngineFailure };
+
+export class UcEngineError extends Error implements EngineFailure {
+  readonly name = 'UcEngineError';
+  readonly code: number;
+  readonly category: string;
+  readonly retryable: boolean;
+
+  constructor(failure: EngineFailure) {
+    super(`Engine failure ${failure.category}`);
+    this.code = failure.code;
+    this.category = failure.category;
+    this.retryable = failure.retryable;
+  }
+}
+
+async function unwrapEngineCall<T>(call: Promise<EngineCallResult<T>>): Promise<T> {
+  const result = await call;
+  if (!result.ok) throw new UcEngineError(result.failure);
+  return result.value;
+}
+
+export type AnalyticsStateChangeReason = 'refresh' | 'reset';
+export type AnalyticsStateListener = (
+  reason: AnalyticsStateChangeReason
+) => void;
+
+const analyticsStateListeners = new Set<AnalyticsStateListener>();
+
+async function publishAnalyticsState(
+  reason: AnalyticsStateChangeReason
+): Promise<void> {
+  try {
+    await NativeModule.getAnalyticsState();
+  } catch {
+    return;
+  }
+  for (const listener of analyticsStateListeners) listener(reason);
+}
+
+export function subscribeAnalyticsState(
+  listener: AnalyticsStateListener
+): () => void {
+  analyticsStateListeners.add(listener);
+  return () => analyticsStateListeners.delete(listener);
+}
+
+export function coreVersion(): string {
+  return NativeModule.coreVersion();
+}
+
+export async function start(config: EngineConfig): Promise<void> {
+  await NativeModule.start(config);
+  await publishAnalyticsState('refresh');
+}
+
+/** Null means no rejected pending input. It does not confirm import success. */
+export async function queryRejectedConfigImport(): Promise<RejectedConfigImport | null> {
+  const result = await unwrapEngineCall(NativeModule.queryRejectedConfigImport());
+  return result.rejection;
+}
+
+export function saveCustomRelayNode(
+  url: string,
+  accessToken: string,
+  previousUrl?: string
+): Promise<RelaySaveResult> {
+  return NativeModule.saveCustomRelayNode(url, accessToken, previousUrl);
+}
+
+export function queryCustomRelays(): Promise<CustomRelay[]> {
+  return NativeModule.queryCustomRelays();
+}
+
+export function queryRelayOverview(): Promise<RelayOverview> {
+  return NativeModule.queryRelayOverview();
+}
+
+export function addCustomRelay(
+  url: string,
+  accessToken: string
+): Promise<CustomRelayMutationResult> {
+  return NativeModule.addCustomRelay(url, accessToken);
+}
+
+export function editCustomRelay(
+  previousUrl: string,
+  url: string,
+  accessToken: string
+): Promise<CustomRelayMutationResult> {
+  return NativeModule.editCustomRelay(previousUrl, url, accessToken);
+}
+
+export function deleteCustomRelay(url: string): Promise<CustomRelayMutationResult> {
+  return NativeModule.deleteCustomRelay(url);
+}
+
+export function shutdown(deadlineMs = 5_000): Promise<void> {
+  return NativeModule.shutdown(deadlineMs);
+}
+
+export function shutdownUntilComplete(): Promise<void> {
+  return NativeModule.shutdownUntilComplete();
+}
+
+export function suspend(): Promise<void> {
+  return NativeModule.suspend();
+}
+
+export function resume(): Promise<void> {
+  return NativeModule.resume();
+}
+
+/**
+ * iOS only. While a listener is subscribed, the native background task waits
+ * for `completeHostSuspension` before it ends, so the listener runs while the
+ * process still holds background time.
+ */
+export function subscribeHostSuspension(
+  listener: (event: HostSuspensionEvent) => void
+): () => void {
+  const subscription = NativeModule.addListener?.('onHostSuspension', listener);
+  return () => subscription?.remove();
+}
+
+/** Reports that host-owned App Group files are closed (`released`) for one transition. */
+export async function completeHostSuspension(
+  transitionId: number,
+  released: boolean
+): Promise<void> {
+  await NativeModule.completeHostSuspension?.(transitionId, released);
+}
+
+export function setBackgroundSyncEnabled(
+  enabled: boolean,
+  appIsBackground: boolean
+): Promise<void> {
+  return NativeModule.setBackgroundSyncEnabled(enabled, appIsBackground);
+}
+
+export function getAnalyticsConsent(): Promise<boolean> {
+  return NativeModule.getAnalyticsConsent();
+}
+
+export function getAnalyticsState(): Promise<AnalyticsState> {
+  return NativeModule.getAnalyticsState();
+}
+
+export async function setAnalyticsConsent(enabled: boolean): Promise<void> {
+  await NativeModule.setAnalyticsConsent(enabled);
+  await publishAnalyticsState('refresh');
+}
+
+export async function resetAnalyticsIdentity(): Promise<void> {
+  await NativeModule.resetAnalyticsIdentity();
+  await publishAnalyticsState('reset');
+}
+
+export async function createSpace(
+  deviceName: string | null,
+  passphrase: string
+): Promise<SpaceCreated> {
+  const result = await unwrapEngineCall(NativeModule.createSpace(deviceName, passphrase));
+  await publishAnalyticsState('refresh');
+  return result;
+}
+
+export function issueInvitation(): Promise<InvitationIssued> {
+  return unwrapEngineCall(NativeModule.issueInvitation());
+}
+
+export async function joinSpace(
+  invitationCode: string,
+  deviceName: string | null,
+  passphrase: string,
+  preserveUnreadableHistory = false
+): Promise<JoinSpaceStatus> {
+  const result = await unwrapEngineCall(
+    NativeModule.joinSpace(invitationCode, deviceName, passphrase, preserveUnreadableHistory)
+  );
+  await publishAnalyticsState('refresh');
+  return result;
+}
+
+export function nextEvent(timeoutMs = 1_000): Promise<EngineEvent | null> {
+  return NativeModule.nextEvent(timeoutMs);
+}
+
+export function cancelJoinSpace(joinId: string): Promise<void> {
+  return NativeModule.cancelJoinSpace(joinId);
+}
+
+export function refreshPeerConnections(): Promise<PeerConnectionRefresh> {
+  return NativeModule.refreshPeerConnections();
+}
+
+export function querySpaceState(): Promise<SpaceState> {
+  return NativeModule.querySpaceState();
+}
+
+export function listDevices(): Promise<Device[]> {
+  return NativeModule.listDevices();
+}
+
+export function queryDeviceGroupChoices(): Promise<DeviceTrustQueryResult> {
+  return NativeModule.queryDeviceGroupChoices();
+}
+
+export function chooseDeviceGroup(
+  issueId: string,
+  choiceId: string,
+  expectedRevision: number,
+  confirmLocalRemoval: boolean
+): Promise<string> {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    return Promise.reject(new Error('Invalid device group revision'));
+  }
+  return NativeModule.chooseDeviceGroup(
+    issueId,
+    choiceId,
+    expectedRevision,
+    confirmLocalRemoval
+  );
+}
+
+export function removeMember(deviceId: string): Promise<WorkspaceConvergence> {
+  return NativeModule.removeMember(deviceId);
+}
+
+export function resendEntry(
+  entryId: string,
+  targetDevices: string[] = [],
+  confirmNewTransfer = false,
+): Promise<ResendEntryOutcome> {
+  return unwrapEngineCall(
+    NativeModule.resendEntry(entryId, targetDevices, confirmNewTransfer),
+  );
+}
+
+export async function leaveSpace(): Promise<void> {
+  await NativeModule.leaveSpace();
+  await publishAnalyticsState('refresh');
+}
+
+export function sendText(
+  text: string,
+  targetDevices: string[] = []
+): Promise<SendReport> {
+  return NativeModule.sendText(text, targetDevices);
+}
+
+export function sendImage(
+  bytes: Uint8Array,
+  mimeType: string,
+  targetDevices: string[] = []
+): Promise<SendReport> {
+  return NativeModule.sendImage(bytes, mimeType, targetDevices);
+}
+
+export function registerInputFile(uri: string, displayName?: string): string {
+  return NativeModule.registerInputFile(uri, displayName ?? null);
+}
+
+export function registerOutputFile(uri: string): string {
+  return NativeModule.registerOutputFile(uri);
+}
+
+export function releaseFileHandle(handle: string): void {
+  NativeModule.releaseFileHandle(handle);
+}
+
+export function sendFiles(
+  fileHandles: string[],
+  targetDevices: string[] = []
+): Promise<SendReport> {
+  return NativeModule.sendFiles(fileHandles, targetDevices);
+}
+
+export function captureCurrentClipboard(): Promise<string | null> {
+  return NativeModule.captureCurrentClipboard();
+}
+
+/**
+ * What the app's own access path read for this change (overlay focus or Shizuku). Android hands it
+ * to the Engine host for this one observation, so the Engine processes the content that was captured
+ * instead of reading the system clipboard again, which a background app may not be allowed to do.
+ */
+export interface CapturedClipboard {
+  text?: string;
+  fileUri?: string;
+  mimeType?: string;
+  displayName?: string;
+}
+
+export function observeClipboardChange(
+  dispatch: boolean,
+  captured?: CapturedClipboard
+): Promise<SendReport | null> {
+  // iOS has no such handoff: its host reads the pasteboard itself.
+  return Platform.OS === 'android'
+    ? NativeModule.observeClipboardChange(dispatch, captured ?? null)
+    : NativeModule.observeClipboardChange(dispatch);
+}
+
+export function restoreClipboard(
+  entryId: string,
+  mode: ClipboardRestoreMode = 'standard'
+): Promise<ClipboardRestoreOutcome> {
+  return NativeModule.restoreClipboard(entryId, mode);
+}
+
+export function exportEntry(
+  entryId: string,
+  destinationHandle: string
+): Promise<void> {
+  return NativeModule.exportEntry(entryId, destinationHandle);
+}
+
+export function queryEntryReceiveProgress(
+  entryId: string
+): Promise<ReceiveProgress | null> {
+  return NativeModule.queryEntryReceiveProgress(entryId);
+}
+
+export function listEntryReceiveProgress(): Promise<ReceiveProgress[]> {
+  return NativeModule.listEntryReceiveProgress();
+}
+
+/**
+ * Asks the Engine to retry selected failed or cancelled items of the expected attempt.
+ * Item identities must come from the current receive snapshot. An empty or invalid
+ * selection is an Engine failure and rejects with `UcEngineError`.
+ */
+export function retryEntryReceive(
+  entryId: string,
+  expectedAttemptId: string,
+  itemIds: string[]
+): Promise<ReceiveRetryOutcome> {
+  return unwrapEngineCall(
+    NativeModule.retryEntryReceive(entryId, expectedAttemptId, itemIds)
+  );
+}
+
+export function cancelEntryReceive(
+  entryId: string,
+  attemptId: string
+): Promise<EntryReceiveCancellation> {
+  return NativeModule.cancelEntryReceive(entryId, attemptId);
+}
+
+export function flushEngineLogs(): Promise<boolean> {
+  return NativeModule.flushEngineLogs();
+}
+
+export function getEngineLogStatus(): Promise<EngineLogStatus> {
+  return NativeModule.getEngineLogStatus();
+}
+
+// The network-library log is a separate source: its state, control and export never go through
+// the business-log calls above. A native module that predates it reports `unsupported`.
+const NETWORK_LOG_UNSUPPORTED = { ok: false, error: 'unsupported' } as const;
+
+export async function getNetworkLogStatus(): Promise<NetworkLogResult<NetworkLogStatus>> {
+  return NativeModule.getNetworkLogStatus ? NativeModule.getNetworkLogStatus() : NETWORK_LOG_UNSUPPORTED;
+}
+
+/** Opens a bounded Detailed window for this process. Repeating it does not extend the window. */
+export async function startNetworkLogCapture(
+  durationMs: number
+): Promise<NetworkLogResult<NetworkLogCaptureStatus>> {
+  return NativeModule.startNetworkLogCapture
+    ? NativeModule.startNetworkLogCapture(durationMs)
+    : NETWORK_LOG_UNSUPPORTED;
+}
+
+export async function stopNetworkLogCapture(
+  captureId: string
+): Promise<NetworkLogResult<Record<string, never>>> {
+  return NativeModule.stopNetworkLogCapture
+    ? NativeModule.stopNetworkLogCapture(captureId)
+    : NETWORK_LOG_UNSUPPORTED;
+}
+
+/** Flushes this process only and stages the network log files for the diagnostic package. */
+export async function prepareNetworkLogExport(): Promise<NetworkLogResult<NetworkLogExport>> {
+  return NativeModule.prepareNetworkLogExport ? NativeModule.prepareNetworkLogExport() : NETWORK_LOG_UNSUPPORTED;
+}
+
+export async function releaseNetworkLogExport(exportId: string): Promise<void> {
+  await NativeModule.releaseNetworkLogExport?.(exportId);
+}
+
+export function getNativeDiagnostics(): Promise<NativeDiagnosticsSnapshot> {
+  return NativeModule.getNativeDiagnostics();
+}
+
+/** Takes a fresh sample and describes the local power sample file. Null where the platform has no power recorder. */
+export async function getPowerMetrics(): Promise<PowerMetricsSnapshot | null> {
+  return NativeModule.getPowerMetrics ? NativeModule.getPowerMetrics() : null;
+}
+
+/** Clears local power statistics only. Diagnostic logs are untouched. */
+export async function resetPowerMetrics(): Promise<boolean> {
+  return NativeModule.resetPowerMetrics ? NativeModule.resetPowerMetrics() : false;
+}
+
+export function startEngineDiagnosticCapture(
+  durationMs = 600_000
+): Promise<EngineCaptureStatus> {
+  return NativeModule.startEngineDiagnosticCapture(durationMs);
+}
+export function stopEngineDiagnosticCapture(
+  captureId: string
+): Promise<'stopped' | 'alreadyStopped' | 'differentCapture'> {
+  return NativeModule.stopEngineDiagnosticCapture(captureId);
+}
+export function getEngineDiagnosticStatus(): Promise<EngineDiagnosticStatus> {
+  return NativeModule.getEngineDiagnosticStatus();
+}
+export function prepareEngineDiagnosticExport(): Promise<EngineDiagnosticExportReport> {
+  return NativeModule.prepareEngineDiagnosticExport();
+}
+
+export function notifyConnectivityOpportunity(
+  reason: ConnectivityOpportunity
+): Promise<void> {
+  return NativeModule.notifyConnectivityOpportunity(reason);
+}
+
+export async function queryOutboundProgress(
+  entryId: string,
+  targetDeviceId: string,
+): Promise<OutboundProgress | null> {
+  return (
+    await unwrapEngineCall(
+      NativeModule.queryOutboundProgress(entryId, targetDeviceId),
+    )
+  ).progress;
+}
+export async function listOutboundProgress(): Promise<OutboundProgress[]> {
+  return (await unwrapEngineCall(NativeModule.listOutboundProgress())).progress;
+}
+/** The classification is not the complete view. Query the view after this action. */
+export async function reconcileOutboundProgress(
+  entryId: string,
+  targetDeviceId: string,
+  expectedAttemptId: string | null = null,
+): Promise<OutboundReconciliation> {
+  return (
+    await unwrapEngineCall(
+      NativeModule.reconcileOutboundProgress(
+        entryId,
+        targetDeviceId,
+        expectedAttemptId,
+      ),
+    )
+  ).state;
+}

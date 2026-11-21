@@ -1,0 +1,136 @@
+# Manual release entry: prepare, build the selected platforms, tag, publish.
+name: release
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to publish (every release consumes one shared build number)'
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - android
+          - ios
+
+# Development TestFlight uploads in build.yml consume the same build counter.
+concurrency:
+  group: unoscil-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release-metadata.outputs.tag }}
+      prerelease: ${{ steps.release-metadata.outputs.prerelease }}
+    steps:
+      - name: Validate release request
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          case "$PLATFORMS" in
+            both|android|ios) ;;
+            *) echo "Unknown platforms selection: $PLATFORMS" >&2; exit 1 ;;
+          esac
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Full releases must run from main, not $GITHUB_REF" >&2
+            exit 1
+          fi
+
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require the latest main commit
+        run: |
+          git fetch origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo "The selected commit is no longer the latest main commit" >&2
+            exit 1
+          fi
+
+      - name: Validate and derive release metadata
+        id: release-metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npm run release:validate
+
+      - name: Require an available release tag
+        env:
+          TAG: ${{ steps.release-metadata.outputs.tag }}
+        run: bash scripts/create-release-tag.sh --check
+
+      # One build counter is shared by both platforms, so every release, even a
+      # single-platform one, must use a number no earlier artifact consumed:
+      # neither a release tag nor a TestFlight upload (dev uploads are untagged).
+      - name: Write App Store Connect API key
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: echo -n "$ASC_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+
+      - name: Require an unused build number
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          TAG: ${{ steps.release-metadata.outputs.tag }}
+        run: |
+          BUNDLE_ID=$(node -p "require('./app.json').expo.ios.bundleIdentifier")
+          ASC_MAX=$(ruby scripts/asc_latest_build.rb "$ASC_API_KEY_ID" "$ASC_API_ISSUER_ID" "$RUNNER_TEMP/AuthKey.p8" "$BUNDLE_ID")
+          node scripts/check-build-number.mjs --require-origin --ignore-tag "$TAG" --asc-max "$ASC_MAX"
+
+      - name: Clean up API key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
+
+  android-build:
+    if: ${{ inputs.platforms != 'ios' }}
+    needs: [prepare]
+    uses: ./.github/workflows/android-build.yml
+    secrets:
+      BUILD_CACHE_R2_ENDPOINT: ${{ secrets.BUILD_CACHE_R2_ENDPOINT }}
+      BUILD_CACHE_R2_ACCESS_KEY_ID: ${{ secrets.BUILD_CACHE_R2_ACCESS_KEY_ID }}
+      BUILD_CACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
+
+  ios-build:
+    if: ${{ inputs.platforms != 'android' }}
+    needs: [prepare]
+    uses: ./.github/workflows/build-ios.yml
+    secrets: inherit
+
+  # A platform left out of the release is skipped rather than successful, so
+  # these gates spell out which build results count as ready.
+  create-release-tag:
+    name: Create release tag
+    if: >-
+      ${{ !cancelled() &&
+      needs.prepare.result == 'success' &&
+      (needs.android-build.result == 'success' || (inputs.platforms == 'ios' && needs.android-build.result == 'skipped')) &&
+      (needs.ios-build.result == 'success' || (inputs.platforms == 'android' && needs.ios-build.result == 'skipped')) }}
+    needs: [prepare, android-build, ios-build]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Checkout validated commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create tag once
+        run: bash scripts/create-release-tag.sh
+
+  publish:
+    if: ${{ !cancelled() && needs.create-release-tag.result == 'success' }}
+    needs: [prepare, android-build, ios-build, create-release-tag]
+    uses: ./.github/workflows/publish.yml
+    secrets: inherit
+    with:
+      tag_name: ${{ needs.prepare.outputs.tag }}
+      platforms: ${{ inputs.platforms }}

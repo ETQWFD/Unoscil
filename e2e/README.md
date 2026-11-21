@@ -1,0 +1,177 @@
+# Mobile E2E (Maestro)
+
+Runs the real bundled App on a fresh, disposable simulator/emulator **for every scenario**.
+No database injection, preview screens, Metro server, or physical-device reset.
+
+## Requirements
+
+- Node from `.nvmrc`, Java 17+, Maestro **2.10.0**.
+- iOS: macOS, Xcode, iOS **26.3** runtime, iPhone **17 Pro** device type.
+- Android: SDK command-line tools, platform-tools, emulator and
+  `system-images;android-36;google_apis;arm64-v8a` (first supported host is Apple Silicon).
+  Set `ANDROID_HOME` if the SDK is outside `~/Library/Android/sdk`.
+- A current, independently runnable Release Simulator `.app` or arm64 `.apk`.
+
+Install the official `cli-2.10.0/maestro.zip` from
+[Maestro releases](https://github.com/mobile-dev-inc/Maestro/releases/tag/cli-2.10.0).
+SHA-256: `29b675e10cc12080e445e9bfb2e2b4e4dfb9c0f2e30d5884120d258b5e1cd991`.
+Extract under `~/.local/share/mobile-e2e/2.10.0/` and make `maestro/bin/maestro`
+executable, or set `MAESTRO_BIN` to your installed executable. The entry point verifies
+its version. CLI analytics and update checks are disabled for test runs.
+
+## Build
+
+Reuse the project's Engine preparation, Expo prebuild and CocoaPods setup. Do not run
+`install:dev` for E2E: that command targets physical development devices.
+For an already prepared development checkout:
+
+```sh
+APP_VARIANT=development xcodebuild build \
+  -workspace ios/UnoscilDev.xcworkspace -scheme UnoscilDev \
+  -configuration Release -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath /tmp/unoscil-e2e-ios \
+  CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=YES
+```
+
+From `android/`:
+
+```sh
+APP_VARIANT=development ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a
+```
+
+If a different variant was prebuilt, use its actual workspace/scheme. Do not disable
+Engine verification to get a build through. The test entry point reads the installed
+application identifier from the provided artifact; no production identifier is hardcoded.
+Simulator builds must preserve App Group entitlements through ad-hoc signing. An unsigned
+build can launch but fail to access shared settings; the entry point rejects it before
+creating a device. No distribution certificate is needed for this simulator signature.
+
+## Run
+
+```sh
+npm run test:e2e -- --platform ios --app /tmp/unoscil-e2e-ios/Build/Products/Release-iphonesimulator/UnoscilDev.app
+npm run test:e2e -- --platform android --app /absolute/path/to/app-arm64-v8a-release.apk
+npm run test:e2e -- --platform ios --app /path/to/UnoscilDev.app --scenario first-launch
+npm run test:e2e -- --platform ios --app /path/to/UnoscilDev.app --repeat 3
+npm run test:e2e:environment
+```
+
+`--scenario <name>` selects an independent scenario. Available scenarios:
+
+| Scenario | Coverage |
+| --- | --- |
+| `first-launch` | Onboarding and persistence across restart |
+| `diagnostic-capture` | Start/stop, page revisit, restart state, UI export and actual archive report checks |
+| `settings-navigation` | Storage row trailing-space tap and return home |
+| `beta-updates` | Android only: full-row risk confirmation, cancel/back, immediate offline check with auto-check disabled, persistence, disable and reconfirm |
+| `history-text-lifecycle` | Real clipboard capture, deduplication, preview, cancellation on Android, deletion and restart |
+| `history-limit-settings` | Android only: edit the maximum history entries with the real keyboard (decrease, 6-digit value, below-minimum and empty rejected), leave the page without blur, restart |
+| `history-limit-retention` | Android only: set the limit to the minimum, capture 11 entries through native Copy, the oldest is dropped and stays dropped after restart |
+| `history-search-filter` | Text and URL capture, query replacement, no results, clearing and type filters |
+| `sms-code-recognition` | Android only: developer-options tool feeds simulated SMS text to the native recognizer (match, spaced digits, no match, ambiguous); no SMS permission, clipboard, history, sync or upload involved |
+| `history-search-dismiss` | iOS only: search layer over home; pull-to-dismiss from suggestions and results, short pull stays, search filters cleared, close button |
+| `history-floating-toolbar` | iOS only: seed 16 entries with native Copy, scroll beneath the toolbar, drag from its transparent leading area, and open the menu; save screenshots and a recording for visual review |
+
+ Omitting the
+option discovers only `.maestro/scenarios/*.yaml`. Repetitions are limited to 1–7. Android also checks the total selected scenarios × repeat against its 15 unique transport pairs before creating any devices; the five-scenario suite supports up to three rounds if enough pairs are available. A suite is run serially with a new
+device for each scenario, including each repetition. Calling Maestro directly is useful
+for debugging but does not provide the environment isolation of this entry point.
+
+## Ownership
+
+- `.maestro/scenarios`: user intent and explicit result checks.
+- `.maestro/online-scenarios`: explicitly selected UI scenarios that require internet access.
+- `.maestro/actions`: reusable actions; platform branches only where behavior differs.
+- `.maestro/assertions`: visible application results.
+- `.maestro/lifecycle`: launch/restart without resetting persisted data. Initial launch assumes a freshly installed app; restart explicitly stops once. Both launch steps disable Maestro's redundant automatic stop.
+- `e2e/environment`: prepare owned device, run Maestro, collect evidence, dispose.
+  It must not implement clicks or interpret flow commands.
+
+Native identifiers are forwarded by the existing AppButton, SettingsNavRow and Android
+settings row. Keep shared controls reusable. Never target a child label and claim that
+it proves full-row interaction.
+
+The storage test taps **85% across the identified row**, not 85% across the screen.
+Inspect `storage-row-before-tap.png` to verify the point remains in empty space if the
+layout changes. English and light appearance are fixed where configured; localized
+content assertions are intentionally scoped to this test locale. Android Wi-Fi is disabled and airplane mode enabled after installation: these local-only scenarios must not depend on
+remote release announcements. The entry point waits for consecutive successful boot, initial provisioning and airplane-mode checks before handing the device to Maestro. ADB remains available. Network scenarios will require a
+separate explicit environment policy.
+
+## Results and failure handling
+
+`e2e/results/<run>/summary.json` records artifact identity, source revision, tool/device
+versions, stage and errors. Each scenario has its own Maestro report/logs, screenshot,
+UI hierarchy and device logs. The original failure is retained if evidence or cleanup
+also fails. Missing hierarchy is recorded explicitly; check evidence completeness.
+The entry point exits nonzero for failures or interruption. It never retries a failed
+business flow automatically.
+
+Owned devices are disposed after capture, including partially failed preparation. Android
+transport port pairs are not reused within a run, even after a prior emulator exits.
+Only the emulator-recommended even console ports 5556–5584 are used (5554 is left
+for normal development); unavailable pairs are skipped.
+SIGINT/SIGTERM interrupts Maestro and allows cleanup; SIGKILL/machine failure cannot
+run cleanup. For recovery, inspect the exact `unoscil-e2e-*` simulator or the run's AVD
+before deleting it. Never use bulk device erasure. Device names/IDs are not accepted as
+inputs, so existing personal simulators and AVDs cannot be selected accidentally.
+
+## Acceptance
+
+Run each scenario independently on both platforms, then both together for three rounds.
+To test the failure path, temporarily change a final assertion to a nonexistent visible
+label, run the scenario, verify nonzero exit, report + screenshot + hierarchy and device
+cleanup, then restore the assertion. Do not commit the deliberate failure.
+
+The framework is not accepted until those runs are recorded. UI navigation success does
+not establish cross-device sync, background behavior, or frame-by-frame animation quality.
+Automatic CI execution is added only after local dual-platform acceptance; use these same
+commands, retaining evidence and an unconditional cleanup step on the dedicated runner.
+
+## History fixture ownership
+
+History scenarios type fixture text into the existing search field, use the native selection menu and **Copy**, then close search. This exercises the actual OS clipboard observer and history writes. Maestro `setClipboard` only sets internal test memory and `pasteText` types that memory; neither is a substitute for setting the OS clipboard in these tests. See the [Maestro clipboard documentation](https://docs.maestro.dev/reference/commands-available/setclipboard) and [pinned command implementation](https://github.com/mobile-dev-inc/Maestro/blob/cli-2.10.0/maestro-orchestra/src/main/java/maestro/orchestra/Orchestra.kt).
+
+Search, selection/copy, context actions, filters and history assertions remain reusable subflows. A card tap copies; phone content preview is opened by long press. iOS deletion is immediate, while Android additionally checks cancellation and confirmation. No artificial phone detail route or database seed is introduced. Fixture links use the reserved `example.invalid` domain.
+
+## Diagnostic capture evidence
+
+`diagnostic-capture` uses the existing settings rows. It confirms a capture survives page navigation, can be stopped, and does not falsely remain active after process restart. iOS leaves the system share sheet open so evidence capture can copy the actual pending ZIP; Android saves through the system directory picker to Documents. Before disposing the owned device, the runner copies the exported ZIP and verifies its Engine revision, stopped capture state, completed flush, typed counter scope and native host records. It never injects application state or accesses a personal device. The full ZIP and decoded manifest remain in `diagnostic-archives/`.
+
+## 联网双向同步验收
+
+### 自定义中继
+
+`custom-relay` 不会加入默认离线套件。它在全新的测试设备上创建独立空间，输入并保存真实中继地址 `https://relay.uni.z2blog.com`：
+
+```bash
+npm run test:e2e -- --platform ios --app /path/to/UnoscilDev.app --scenario custom-relay
+npm run test:e2e -- --platform android --app /path/to/app-arm64-v8a-release.apk --scenario custom-relay
+```
+
+该场景验证两端从输入、按钮启用到保存完成的完整用户操作，并让应用在联网状态下重建中继连接；它不证明跨设备内容一定经过该中继传输。
+
+### 双向同步
+
+显式选择 `bidirectional-sync`，并提供同版本的桌面 `unoscil` 与相邻 `unoscild`。
+默认套件仍然离线，不会自动执行联网场景。
+
+```bash
+npm run test:e2e -- --platform ios --app /path/to/Release-iphonesimulator/UnoscilDev.app --scenario bidirectional-sync --peer-cli /path/to/unoscil
+npm run test:e2e -- --platform android --app /path/to/app-arm64-v8a-release.apk --scenario bidirectional-sync --peer-cli /path/to/unoscil
+```
+
+运行器创建独立临时桌面空间，以无系统剪贴板的服务模式启动对端。
+Maestro 操作手机页面选择直接同步、输入邀请码及测试密码；通过真实发送和系统复制验证
+两个方向，并在手机重启后重复，最后从页面导出诊断包。重启后最多等待 60 秒自动上线，
+只读取状态，不主动探测连接；若未恢复或发送失败，仍尝试从页面导出证据，并保留失败结果。
+重启后的发送允许先离线排队，但不把排队当作成功：不重复发送，必须在手机页面出现完整内容，
+且手机回传文本也被桌面实际收到，才算通过。测试记录、对端日志和导出包留在
+本次结果目录；本次拥有的桌面空间及模拟器在结束时清理。
+
+测试只证明新空间的正常同步，不代表历史空间状态冲突或缺失更新已经自动恢复。
+请勿提供版本不匹配的桌面程序，也不要使用当前个人空间替代临时对端。
+
+## SMS code auto-copy (emulator only)
+
+`scripts/e2e-sms-code-auto-copy.sh <emulator-serial> <apk>` checks the real SMS receive path with synthetic messages. `adb emu sms send` makes the emulator deliver a system `SMS_RECEIVED` broadcast, so no real SMS, phone or personal device is involved (non-emulator serials are refused). It covers: default off, enabling through the real switch and permission prompts, ignored (non-matching / ambiguous) messages, a matching message while the app process is dead, the notification showing the plaintext code with a Copy action and not claiming "copied" before a verified write, the Copy action, history recording, the real clipboard content, and revoking `RECEIVE_SMS`. Flows live in `.maestro/emulator-sms/` (not part of `test:e2e` because of the external adb step). Run it on a freshly booted emulator: the OS clipboard survives app reinstalls and would otherwise be picked up as history.

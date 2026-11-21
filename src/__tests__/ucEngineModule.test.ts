@@ -1,0 +1,616 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const moduleRoot = join(process.cwd(), 'modules', 'uc-engine');
+
+function read(relativePath: string): string {
+  const path = join(moduleRoot, relativePath);
+  return existsSync(path) ? readFileSync(path, 'utf8') : '';
+}
+
+describe('unified P2P engine native module', () => {
+  it('keeps the P2P engine separate from the LAN compatibility module', () => {
+    const config = read('expo-module.config.json');
+    const javascript = read('src/index.ts');
+
+    expect(config).toContain('"name": "uc-engine"');
+    expect(config).toContain('"UcEngineModule"');
+    expect(javascript).toContain('requireNativeModule');
+    expect(javascript).toContain("('UcEngine')");
+    expect(javascript).not.toContain("requireNativeModule('UcCore')");
+  });
+
+  it('exposes lifecycle, space, content, event, clipboard, and file operations', () => {
+    const javascript = read('src/index.ts');
+
+    for (const operation of [
+      'coreVersion',
+      'start',
+      'shutdown',
+      'suspend',
+      'resume',
+      'setBackgroundSyncEnabled',
+      'createSpace',
+      'issueInvitation',
+      'joinSpace',
+      'cancelJoinSpace',
+      'nextEvent',
+      'refreshPeerConnections',
+      'sendText',
+      'sendImage',
+      'registerInputFile',
+      'registerOutputFile',
+      'sendFiles',
+      'captureCurrentClipboard',
+      'observeClipboardChange',
+      'restoreClipboard',
+      'exportEntry',
+      'releaseFileHandle',
+    ]) {
+      expect(javascript).toMatch(new RegExp(`export (?:async )?function ${operation}\\b`));
+    }
+  });
+
+  it('keeps automatic clipboard observation on the engine-owned source check', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).not.toContain('observeClipboardTextChange');
+    expect(swift).not.toContain('AsyncFunction("observeClipboardTextChange")');
+    expect(kotlin).not.toContain('AsyncFunction("observeClipboardTextChange")');
+  });
+
+  it('exposes authoritative custom relay operations on JavaScript, iOS, and Android', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    for (const operation of [
+      'queryCustomRelays',
+      'queryRelayOverview',
+      'addCustomRelay',
+      'editCustomRelay',
+      'deleteCustomRelay',
+    ]) {
+      expect(javascript).toContain(`function ${operation}`);
+      expect(swift).toContain(`AsyncFunction("${operation}")`);
+      expect(kotlin).toContain(`AsyncFunction("${operation}")`);
+    }
+  });
+
+  it('forwards join cancellation to the Engine on both platforms', () => {
+    expect(read('src/index.ts')).toContain('return NativeModule.cancelJoinSpace(joinId)');
+    expect(read('ios/UcEngineModule.swift')).toContain('try self.requireEngine().cancelJoinSpace(joinId: joinId)');
+    expect(read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt'))
+      .toContain('requireEngine().cancelJoinSpace(joinId)');
+  });
+
+  it('maps every terminal join result on both native platforms', () => {
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(swift).toContain('case let .terminated(joinId, reason):');
+    expect(kotlin).toContain('is JoinSpaceStatus.Terminated -> mapOf(');
+    for (const reason of ['cancelled', 'expired', 'superseded']) {
+      expect(swift).toContain(`: "${reason}"`);
+      expect(kotlin).toContain(`-> "${reason}"`);
+    }
+  });
+
+  it('maps Processing without claiming admission on either platform', () => {
+    expect(read('ios/UcEngineModule.swift')).toContain('case let .processing(');
+    expect(read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt'))
+      .toContain('is JoinSpaceStatus.Processing -> mapOf(');
+  });
+
+  it('maps the Engine-owned join attention result on both native platforms', () => {
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(swift).toContain('case let .needsAttention(');
+    expect(kotlin).toContain('is JoinSpaceStatus.NeedsAttention -> mapOf(');
+    expect(swift).toContain('"type": "needsAttention"');
+    expect(kotlin).toContain('"type" to "needsAttention"');
+    expect(swift).toContain('case .outcomeCannotBeProven: "outcomeCannotBeProven"');
+    expect(swift).toContain('case .continuationUnavailable: "continuationUnavailable"');
+    expect(kotlin).toContain('JoinSpaceAttentionReason.CONTINUATION_UNAVAILABLE -> "continuationUnavailable"');
+    expect(swift).toContain('case .restartWithNewInvitation: "restartWithNewInvitation"');
+    expect(kotlin).toContain(
+      'JoinSpaceAttentionRecovery.RESTART_WITH_NEW_INVITATION -> "restartWithNewInvitation"'
+    );
+    expect(swift).toContain('"reason": attentionReason');
+    expect(swift).toContain('"recovery": attentionRecovery');
+  });
+
+  it('does not expose the removed workspace convergence query or event', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).not.toContain('queryWorkspaceConvergence');
+    expect(javascript).not.toContain("type: 'workspaceConvergenceChanged'");
+    expect(swift).not.toContain('AsyncFunction("queryWorkspaceConvergence")');
+    expect(swift).not.toContain('case .workspaceConvergenceChanged');
+    expect(kotlin).not.toContain('AsyncFunction("queryWorkspaceConvergence")');
+    expect(kotlin).not.toContain('BindingEvent.WorkspaceConvergenceChanged');
+  });
+
+  it('exposes device trust query and decision on JavaScript, iOS, and Android', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    for (const operation of ['queryDeviceGroupChoices', 'chooseDeviceGroup']) {
+      expect(javascript).toMatch(new RegExp(`export (?:async )?function ${operation}\\b`));
+      expect(swift).toContain(`AsyncFunction("${operation}")`);
+      expect(kotlin).toContain(`AsyncFunction("${operation}")`);
+    }
+
+    expect(javascript).toContain('choiceId: string');
+    expect(javascript).toContain('confirmLocalRemoval: boolean');
+    expect(swift).toContain('expectedRevision: UInt64, confirmLocalRemoval: Bool');
+    expect(kotlin).toContain('expectedRevision: Long, confirmLocalRemoval: Boolean');
+  });
+
+  it('returns structured device trust query failures on both native platforms', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain('export type DeviceTrustQueryResult');
+    expect(javascript).toContain('queryDeviceGroupChoices(): Promise<DeviceTrustQueryResult>');
+    expect(swift).toContain('case let .Engine(code, category, retryable)');
+    expect(swift).toContain('"failure": Self.engineFailureMap(');
+    expect(kotlin).toContain('is BindingException.Engine -> mapOf(');
+    expect(kotlin).toContain('"failure" to engineFailureMap(error)');
+  });
+
+  it('maps device trust changes to a revision-only event on both native platforms', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain("type: 'deviceTrustChanged'; revision: number");
+    expect(swift).toContain('case .deviceTrustChanged(let revision):');
+    expect(swift).toContain('["type": "deviceTrustChanged", "revision": revision]');
+    expect(kotlin).toContain('is BindingEvent.DeviceTrustChanged -> mapOf(');
+    expect(kotlin).toContain('"type" to "deviceTrustChanged"');
+    expect(kotlin).toContain('"revision" to event.revision.toLong()');
+  });
+
+  it('maps the re-pairing state and event on both native platforms', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain('rePairingRequired: boolean');
+    expect(javascript).toContain("type: 'rePairingRequired'; scope: 'allDevices'");
+    expect(swift).toContain('"rePairingRequired": result.rePairingRequired');
+    expect(swift).toContain('case .rePairingRequired(let scope):');
+    expect(swift).toContain('"type": "rePairingRequired"');
+    expect(kotlin).toContain('"rePairingRequired" to result.rePairingRequired');
+    expect(kotlin).toContain('is BindingEvent.RePairingRequired -> mapOf(');
+    expect(kotlin).toContain('"type" to "rePairingRequired"');
+  });
+
+  it('maps detailed clipboard, delivery, transfer, and presence events on both platforms', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    for (const eventType of [
+      'incomingEntry',
+      'incomingPending',
+      'receiveAttemptStateChanged',
+      'deliveryStatusChanged',
+      'peerPresenceChanged',
+      'transferProgress',
+      'transferStatusChanged',
+      'activeClipboardChanged',
+      'networkRecoveryChanged',
+    ]) {
+      expect(javascript).toContain(`type: '${eventType}'`);
+      expect(swift).toContain(`"type": "${eventType}"`);
+      expect(kotlin).toContain(`"type" to "${eventType}"`);
+    }
+  });
+
+  it('exposes complete space management on JavaScript, iOS, and Android', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    for (const operation of [
+      'querySpaceState',
+      'listDevices',
+      'removeMember',
+      'resendEntry',
+      'leaveSpace',
+    ]) {
+      expect(javascript).toMatch(new RegExp(`export (?:async )?function ${operation}\\b`));
+      expect(swift).toContain(`AsyncFunction("${operation}")`);
+      expect(kotlin).toContain(`AsyncFunction("${operation}")`);
+    }
+  });
+
+  it('passes unreadable-history confirmation and result counts on both platforms', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain('preserveUnreadableHistory: boolean');
+    expect(javascript).toContain('preservedUnreadableRecords: number');
+    expect(swift).toContain('preserveUnreadableHistory: Bool');
+    expect(swift).toContain('"preservedUnreadableRecords"');
+    expect(kotlin).toContain('preserveUnreadableHistory: Boolean');
+    expect(kotlin).toContain('"preservedUnreadableRecords"');
+  });
+
+  it('converts workspace convergence results for both native platforms', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain('export interface WorkspaceConvergence');
+    expect(javascript).toContain('pendingRemovalDecisionDeviceIds: string[]');
+    expect(javascript).toContain('divergedPeerDeviceIds: string[]');
+    expect(javascript).toContain('upgradeRequiredPeerDeviceIds: string[]');
+    expect(javascript).toContain('failureCategory: WorkspaceConvergenceFailureCategory | null');
+    expect(javascript).toContain('updatedAtMs: number');
+    expect(javascript).toContain('removeMember(deviceId: string): Promise<WorkspaceConvergence>');
+    expect(kotlin).toContain('val result = engine.removeMember(deviceId)');
+    expect(kotlin).toContain('"historyEventCount" to convergence.historyEventCount.toLong()');
+    expect(kotlin).toContain('refreshAnalyticsContext(engine)');
+    expect(swift).toContain('let result = try engine.removeMember(deviceId: deviceId)');
+    expect(swift).toContain('"historyEventCount": convergence.historyEventCount');
+    expect(swift).toContain('self.host.refreshAnalyticsContext(engine: engine)');
+  });
+
+  it('maps the synchronization-disabled resend result on both native platforms', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain("kind: 'synchronizationDisabled'");
+    expect(swift).toContain('case .synchronizationDisabled:');
+    expect(kotlin).toContain('ResendEntryOutcome.SynchronizationDisabled');
+  });
+
+  it('exposes receive snapshots, cancellation and selected retry on JavaScript, iOS, and Android', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    for (const operation of [
+      'queryEntryReceiveProgress',
+      'listEntryReceiveProgress',
+      'retryEntryReceive',
+      'cancelEntryReceive',
+    ]) {
+      expect(javascript).toMatch(new RegExp(`export (?:async )?function ${operation}\\b`));
+      expect(swift).toContain(`AsyncFunction("${operation}")`);
+      expect(kotlin).toContain(`AsyncFunction("${operation}")`);
+    }
+    expect(swift).toContain(
+      'retryEntryReceive(entryId: entryId, expectedAttemptId: expectedAttemptId, itemIds: itemIds)'
+    );
+    expect(kotlin).toContain('retryEntryReceive(entryId, expectedAttemptId, itemIds)');
+    expect(swift).toContain('cancelEntryReceive(entryId: entryId, attemptId: attemptId)');
+    expect(kotlin).toContain('cancelEntryReceive(entryId, attemptId)');
+  });
+
+  it('maps every receive retry outcome and per-item field identically on both platforms', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    for (const kind of [
+      'accepted',
+      'alreadyReceiving',
+      'superseded',
+      'cancellationIncomplete',
+      'unavailable',
+    ]) {
+      expect(javascript).toContain(`kind: '${kind}'`);
+      expect(swift).toContain(`"kind": "${kind}"`);
+      expect(kotlin).toContain(`"kind" to "${kind}"`);
+    }
+    for (const field of [
+      'itemId',
+      'failureReason',
+      'itemsTotal',
+      'itemsCompleted',
+      'completedBytes',
+      'totalBytes',
+      'attemptId',
+    ]) {
+      expect(javascript).toContain(`${field}`);
+      expect(swift).toContain(`"${field}"`);
+      expect(kotlin).toContain(`"${field}" to`);
+    }
+    expect(swift).toContain('case .accepted(let attemptId):');
+    expect(kotlin).toContain('is ReceiveRetryOutcome.Accepted ->');
+    expect(swift).toContain('case .unavailable(let reason):');
+    expect(kotlin).toContain('is ReceiveRetryOutcome.Unavailable ->');
+  });
+
+  it('reports retry failures as structured data and never as a bridge message', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain(
+      'retryEntryReceive(\n    entryId: string,\n    expectedAttemptId: string,\n    itemIds: string[]\n  ): Promise<EngineCallResult<ReceiveRetryOutcome>>'
+    );
+    expect(javascript).toContain('unwrapEngineCall(');
+    expect(swift).toMatch(/AsyncFunction\("retryEntryReceive"\)[\s\S]*?engineResult/);
+    expect(kotlin).toMatch(/AsyncFunction\("retryEntryReceive"\)[\s\S]*?engineResult/);
+  });
+
+  it('keeps receive queries out of the native lifecycle and file-handle ownership', () => {
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    for (const source of [swift, kotlin]) {
+      expect(source).not.toMatch(/retryEntryReceive[\s\S]{0,200}(registerOutputFile|releaseFileHandle)/);
+    }
+  });
+
+  it('preserves the local-device marker on JavaScript, iOS, and Android', () => {
+    const javascript = read('src/index.ts');
+    const swift = read('ios/UcEngineModule.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain('isLocal: boolean');
+    expect(swift).toContain('let localDeviceId = try engine.queryLocalDevice().deviceId');
+    expect(swift).toContain('"isLocal": $0.deviceId == localDeviceId');
+    expect(kotlin).toContain('val localDeviceId = engine.queryLocalDevice().deviceId');
+    expect(kotlin).toContain('"isLocal" to (it.deviceId == localDeviceId)');
+  });
+
+  it('uses Keychain and native app lifecycle on iOS without a file fallback', () => {
+    const swift = `${read('ios/UcEngineModule.swift')}\n${read(
+      'ios/SharedEngineHost.swift'
+    )}\n${read('ios/NativeSystemHost.swift')}`;
+
+    expect(swift).toContain('kSecClassGenericPassword');
+    expect(swift).toContain('SecItemCopyMatching');
+    expect(swift).toContain('SecItemUpdate');
+    expect(swift).toContain('OnAppEntersBackground');
+    expect(swift).toContain('OnAppEntersForeground');
+    expect(swift).toContain('NativeLifecycleHost');
+    expect(swift).toContain('MobileStartupLifecycle()');
+    expect(swift).toContain('startWithAnalyticsAndLifecycle');
+    expect(swift).toContain('backgroundTimeRemaining');
+    expect(swift).toContain('suspendWithDeadline');
+    expect(swift).toContain('AsyncFunction("shutdownUntilComplete")');
+    expect(swift).toContain(
+      'private static func beginBackgroundActivity() -> any NativeBackgroundActivity'
+    );
+    expect(swift).toContain('recoverSession(allowSecureStorageUnlock: true)');
+    expect(swift).not.toContain('try? self.currentEngine()?.suspend()');
+    expect(swift).not.toContain('try? self.currentEngine()?.resume()');
+    expect(swift).toContain('FileHandleRegistry');
+    expect(swift).not.toContain('UserDefaults');
+  });
+
+  it('uses Android Keystore and native activity lifecycle without plaintext key storage', () => {
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(kotlin).toContain('KeyStore.getInstance("AndroidKeyStore")');
+    expect(kotlin).toContain('KeyGenParameterSpec.Builder');
+    expect(kotlin).toContain('OnActivityEntersBackground');
+    expect(kotlin).toContain('OnActivityEntersForeground');
+    expect(kotlin).toContain('NativeLifecycleHost');
+    expect(kotlin).toContain('MobileStartupLifecycle()');
+    expect(kotlin).toContain('startWithAnalyticsAndLifecycle');
+    expect(kotlin).toContain('suspendWithDeadline');
+    expect(kotlin).toContain('AsyncFunction("shutdownUntilComplete")');
+    expect(kotlin).toContain('AsyncFunction("setBackgroundSyncEnabled")');
+    expect(kotlin).toContain('recoverSession(true)');
+    expect(kotlin).not.toContain('runCatching { currentEngine()?.suspend() }');
+    expect(kotlin).not.toContain('runCatching { currentEngine()?.resume() }');
+    expect(kotlin).toContain('FileHandleRegistry');
+    expect(kotlin).not.toContain('putString(key');
+  });
+
+  it('keeps Android event polling off the serialized native operation queue', () => {
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+    const nextEventStart = kotlin.indexOf('AsyncFunction("nextEvent")');
+    const nextOperationStart = kotlin.indexOf(
+      'AsyncFunction("refreshPeerConnections")',
+      nextEventStart
+    );
+    const nextEventDefinition = kotlin.slice(nextEventStart, nextOperationStart);
+
+    expect(nextEventStart).toBeGreaterThan(-1);
+    expect(nextOperationStart).toBeGreaterThan(nextEventStart);
+    expect(nextEventDefinition).toContain('.runOnQueue(appContext.backgroundCoroutineScope)');
+  });
+
+  it('keeps blocking iOS engine work off the shared Expo async-function queue', () => {
+    const swift = read('ios/UcEngineModule.swift');
+    const nextEventStart = swift.indexOf('AsyncFunction("nextEvent")');
+    const nextOperationStart = swift.indexOf(
+      'AsyncFunction("refreshPeerConnections")',
+      nextEventStart
+    );
+    const nextEventDefinition = swift.slice(nextEventStart, nextOperationStart);
+
+    expect(swift).toContain(
+      'private let engineOperationQueue = DispatchQueue(label: "app.unoscil.uc-engine")'
+    );
+    expect(swift).toContain(
+      'private let engineEventQueue = DispatchQueue(label: "app.unoscil.uc-engine-events")'
+    );
+    expect(swift).toMatch(/AsyncFunction\("start"\)[\s\S]*?\.runOnQueue\(engineOperationQueue\)/);
+    expect(nextEventDefinition).toContain('.runOnQueue(engineEventQueue)');
+    expect(swift.slice(nextOperationStart)).toMatch(
+      /AsyncFunction\("refreshPeerConnections"\)[\s\S]*?\.runOnQueue\(engineOperationQueue\)/
+    );
+  });
+
+  it('installs the Android JNI context before starting the P2P engine', () => {
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    const installContext = kotlin.indexOf('UcEngineModule.installAndroidContext(context)');
+    const startEngine = kotlin.indexOf('MobileEngine.startWithAnalyticsAndLifecycle(');
+
+    expect(installContext).toBeGreaterThan(-1);
+    expect(startEngine).toBeGreaterThan(installContext);
+  });
+
+  it('supplies platform analytics context when each native engine starts', () => {
+    const swift = read('ios/SharedEngineHost.swift');
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(swift).toContain('context: analyticsContext()');
+    expect(swift).toContain('os: .ios');
+    expect(kotlin).toContain('analyticsContext()');
+    expect(kotlin).toContain('BindingAnalyticsOs.ANDROID');
+  });
+
+  it('preserves declared file names when native hosts write received files to the clipboard', () => {
+    const swift = `${read('ios/UcEngineModule.swift')}\n${read('ios/SharedEngineHost.swift')}`;
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(swift).toContain('clipboardShares.create(displayName: displayName)');
+    expect(swift).not.toContain(
+      'UIPasteboard.general.url = try withHostBindingError { try self.files.url(handle) }'
+    );
+    expect(kotlin).toContain('createClipboardShareFile(context, representation.displayName)');
+  });
+
+  it('restores every core plain-text representation as Android text', () => {
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(kotlin).toContain('isPlainTextRepresentation');
+    expect(kotlin).toContain('"public.utf8-plain-text"');
+    expect(kotlin).toContain('format.substringBefore');
+    expect(kotlin).toContain('normalizedFormat.equals("text", ignoreCase = true)');
+  });
+
+  it('preserves selected file names when registering opaque input handles', () => {
+    const javascript = read('src/index.ts');
+    const swift = `${read('ios/UcEngineModule.swift')}\n${read(
+      'ios/SharedEngineHost.swift'
+    )}\n${read('ios/NativeSystemHost.swift')}`;
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+
+    expect(javascript).toContain('registerInputFile(uri: string, displayName?: string)');
+    expect(swift).toContain('register(uri: uri, writable: false, displayName: displayName)');
+    expect(swift).toContain('displayName: target.displayName ?? target.url.lastPathComponent');
+    expect(kotlin).toContain('requireFiles().register(uri, false, displayName)');
+    expect(kotlin).toContain('target.displayName ?:');
+  });
+
+  it('pins both platform artifacts to the same verified engine source', () => {
+    const pin = JSON.parse(read('core-source.json')) as {
+      repository: string;
+      version: string;
+      sourceCommit: string;
+      artifactSource?: string;
+      sourceStateSha256?: string;
+      releaseManifestSha256?: string;
+      swiftPackageChecksum?: string;
+      artifacts: Record<string, string>;
+    };
+
+    expect(pin.repository).toBe('UniClipboard/Engine');
+    expect(pin.version).toMatch(/^v\d+\.\d+\.\d+(?:-[a-z0-9.]+)?$/);
+    expect(pin.sourceCommit).toMatch(/^[a-f0-9]{40}$/);
+    if (pin.artifactSource === 'local-build') {
+      expect(pin.sourceStateSha256).toMatch(/^[a-f0-9]{64}$/);
+    } else if (pin.artifactSource === 'commit') {
+      // Commit pins build artifacts from source, so no release checksums are recorded.
+      expect(pin.releaseManifestSha256).toBeUndefined();
+    } else {
+      expect(pin.artifactSource).toBeUndefined();
+      expect(pin.releaseManifestSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(pin.swiftPackageChecksum).toBe(pin.artifacts['UniClipboardEngine.xcframework.zip']);
+    }
+    if (pin.artifactSource === 'commit') return;
+    for (const artifact of [
+      'UniClipboardEngine.aar',
+      'UniClipboardEngine.pom',
+      'runtime-dependencies.txt',
+      'uc_engine_uniffi.kt',
+      'uc_engine_uniffi.swift',
+    ]) {
+      expect(pin.artifacts[artifact]).toMatch(/^[a-f0-9]{64}$/);
+    }
+
+    if (pin.artifactSource !== 'local-build') {
+      for (const artifact of [
+        'UniClipboardEngine.aar.checksum.txt',
+        'UniClipboardEngine.xcframework.checksum.txt',
+        'UniClipboardEngine.xcframework.zip',
+        'source-commit.txt',
+        'version.txt',
+      ]) {
+        expect(pin.artifacts[artifact]).toMatch(/^[a-f0-9]{64}$/);
+      }
+    }
+  });
+});
+
+describe('Engine rc.6 host contract', () => {
+  it('installs process observability before each Apple engine entry point', () => {
+    const host = read('ios/SharedEngineHost.swift');
+    expect(host).toContain('installProcessObservability(');
+    expect(
+      host.match(
+        /try installEngineObservability\(appVersion: appVersion, host: host, networkRole: \.(mobileApp|keyboardExtension)\)/g
+      )
+    ).toHaveLength(2);
+    // The network log is configured before the process subscriber exists, or it never starts.
+    expect(host.indexOf('NetworkLogHost.configureBeforeInstall(role: networkRole)')).toBeGreaterThan(-1);
+    expect(host.indexOf('NetworkLogHost.configureBeforeInstall(role: networkRole)')).toBeLessThan(
+      host.indexOf('try installProcessObservability(')
+    );
+    expect(host).toContain('remoteDiagnosticsEnabled: false');
+    expect(host).not.toContain('shutdownProcessObservability(');
+  });
+
+  it('installs Android context then observability before engine creation', () => {
+    const kotlin = read('android/src/main/java/expo/modules/ucengine/UcEngineModule.kt');
+    // The process-wide EngineOwner performs the start; the JS module only attaches to it.
+    const start = kotlin.slice(kotlin.indexOf('internal fun start('));
+    expect(start.indexOf('installProcessObservability(')).toBeGreaterThan(
+      start.indexOf('UcEngineModule.installAndroidContext(context)')
+    );
+    // The network log is configured before the process subscriber exists, or it never starts.
+    expect(start.indexOf('NetworkLogHost.configureBeforeInstall(')).toBeGreaterThan(-1);
+    expect(start.indexOf('NetworkLogHost.configureBeforeInstall(')).toBeLessThan(
+      start.indexOf('installProcessObservability(')
+    );
+    expect(start.indexOf('installProcessObservability(')).toBeLessThan(
+      start.indexOf('MobileEngine.startWithAnalyticsAndLifecycle(')
+    );
+  });
+
+  it('exposes revision-checked device group choices on both platforms', () => {
+    for (const path of [
+      'ios/UcEngineModule.swift',
+      'android/src/main/java/expo/modules/ucengine/UcEngineModule.kt',
+    ]) {
+      const source = read(path);
+      expect(source).toContain('AsyncFunction("queryDeviceGroupChoices")');
+      expect(source).toContain('AsyncFunction("chooseDeviceGroup")');
+      expect(source).toContain('expectedRevision');
+      expect(source).not.toContain('AsyncFunction("decideDeviceTrustChange")');
+    }
+  });
+
+  it('preserves full invitations and peer upgrade status', () => {
+    for (const path of [
+      'ios/UcEngineModule.swift',
+      'android/src/main/java/expo/modules/ucengine/UcEngineModule.kt',
+    ]) {
+      const source = read(path);
+      expect(source).toContain('"fullInvitation"');
+      expect(source).toContain('"peerUpgradeRequired"');
+    }
+  });
+});

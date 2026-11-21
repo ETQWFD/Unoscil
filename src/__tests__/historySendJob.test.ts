@@ -1,0 +1,51 @@
+import type { ClipboardItem } from '@/types/clipboard';
+import {
+  canSendHistoryItem,
+  createHistorySendJob,
+  createTextSendJob,
+} from '@/utils/historySendJob';
+
+function item(overrides: Partial<ClipboardItem>): ClipboardItem {
+  return {
+    type: 'Text',
+    text: 'hello',
+    profileHash: 'HASH',
+    hasData: false,
+    timestamp: 1,
+    starred: false,
+    syncStatus: 1,
+    version: 1,
+    lastModified: 0,
+    lastAccessed: 0,
+    isDeleted: false,
+    pinned: false,
+    isLocalFileReady: true,
+    ...overrides,
+  } as ClipboardItem;
+}
+
+describe('historySendJob', () => {
+  it('writes text history to a temporary payload tagged with the history hash', async () => {
+    const job = (await createHistorySendJob(item({}), 'text'))!;
+    expect(job).toMatchObject({ kind: 'text', historyProfileHash: 'HASH' });
+    expect(job.fileUri).toContain('send_to/HASH.txt');
+  });
+
+  it('refuses content that is not on this device', async () => {
+    const remote = item({ type: 'File', fileUri: undefined, isLocalFileReady: false });
+    expect(canSendHistoryItem(remote, 'file')).toBe(false);
+    expect(await createHistorySendJob(remote, 'file')).toBeNull();
+  });
+
+  it('writes a text snippet to a temporary payload without a history hash', () => {
+    // 不带 historyProfileHash:发送时先把这段文字导入历史,再按新条目投递
+    const job = createTextSendJob('片段')!;
+    expect(job.kind).toBe('text');
+    expect(job.historyProfileHash).toBeUndefined();
+    expect(job.fileUri).toContain('send_to/');
+  });
+
+  it('refuses an empty snippet', () => {
+    expect(createTextSendJob('  ')).toBeNull();
+  });
+});

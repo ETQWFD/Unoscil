@@ -1,0 +1,215 @@
+# Copies the already published Android APK to a GitCode Release and registers
+# the verified copy with FlareRelease, which then redirects users in mainland
+# China to it. GitHub and R2 stay the authoritative sources: this workflow only
+# adds an optional mirror and never rebuilds, re-signs or repackages the APK.
+#
+# Where the transfer runs: GitCode's upload endpoint is in mainland China and a
+# GitHub runner reaches it at a few KiB/s (a 94 MiB APK never finishes), while a
+# host in Shanghai uploads it in under two minutes. So this job logs in to that
+# host over SSH and `scripts/remote/gitcode-mirror-host.py` (the forced command of
+# the key) downloads the APK from R2, which is fast from China, checks it against
+# the SHA-256 of the artifact released here, and runs the upload script that is
+# installed on the host. Only a one-line request and the settings travel over the
+# SSH session (nothing is stored there); no code does, so the key cannot be used
+# to run anything else. The host refuses a script that differs from this commit's.
+#
+# - Called by publish.yml after the FlareRelease registration, non-blocking:
+#   a missing configuration or a failed mirror produces a warning annotation
+#   and a job summary, never a failed release.
+# - Run by hand (workflow_dispatch) to retry or to mirror an older tag. It
+#   downloads the APK from the GitHub Release (only to compute its SHA-256) and
+#   fails loudly. FlareRelease accepts the mirror only when size and SHA-256
+#   equal the registered artifact.
+#
+# Configuration (nothing is created by this workflow):
+#   environment mirror (only the main branch may use it) with the secret
+#   secret   MIRROR_SSH_KEY                       private key whose public half is authorized on the host
+#   variable MIRROR_SSH_HOST, MIRROR_SSH_USER     the Shanghai host and its unprivileged user (default unoscil-mirror)
+#   variable MIRROR_SSH_PORT (optional)           default 22
+#   variable MIRROR_SSH_KNOWN_HOSTS               the host's public keys (ssh-keyscan output)
+#   secret   GITCODE_RELEASE_TOKEN                GitCode bot token with release write access to the mirror repository
+#   variable GITCODE_OWNER, GITCODE_REPO          the mirror repository (must exist, with a commit on its default branch)
+#   variable GITCODE_API_BASE (optional)          default https://api.gitcode.com/api/v5
+#   variable GITCODE_TARGET_COMMITISH (optional)  branch for new release tags, default main
+#   secret   FLARE_RELEASE_ACCESS_CLIENT_ID/SECRET already used by publish.yml
+
+name: mirror-android-gitcode
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Release tag whose APK is mirrored'
+        required: true
+        type: string
+      non_blocking:
+        description: 'Report problems as warnings instead of failing the run'
+        required: false
+        default: false
+        type: boolean
+      from_release:
+        description: 'Take the APK from the GitHub Release instead of this run'
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag whose APK is mirrored (for example v2.0.0.186)'
+        required: true
+        type: string
+      from_release:
+        description: 'Take the APK from the GitHub Release (a manual run has no build artifact)'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: gitcode-mirror-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror APK to GitCode
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    # The SSH key is an environment secret that only the main branch may use.
+    environment: mirror
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Same run as the build: the exact artifact that was uploaded to R2.
+      - name: Download the built APK
+        if: ${{ inputs.from_release != true }}
+        continue-on-error: ${{ inputs.non_blocking == true }}
+        uses: actions/download-artifact@v8
+        with:
+          name: apk-arm64-v8a
+          path: apk/
+
+      # Retry or backfill: the APK attached to the GitHub Release.
+      - name: Download the APK from the GitHub Release
+        if: ${{ inputs.from_release == true }}
+        continue-on-error: ${{ inputs.non_blocking == true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --pattern '*-arm64-v8a.apk' --dir apk
+
+      - name: Mirror the APK
+        id: mirror
+        continue-on-error: ${{ inputs.non_blocking == true }}
+        # Shorter than the job timeout: a job timeout would fail the run even
+        # though this step is non-blocking. The upload script stops itself earlier still.
+        timeout-minutes: 45
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          NON_BLOCKING: ${{ inputs.non_blocking == true && 'true' || 'false' }}
+          PRERELEASE: ${{ contains(inputs.tag_name, '-alpha.') || contains(inputs.tag_name, '-beta') }}
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+          MIRROR_SSH_HOST: ${{ vars.MIRROR_SSH_HOST }}
+          MIRROR_SSH_USER: ${{ vars.MIRROR_SSH_USER }}
+          MIRROR_SSH_PORT: ${{ vars.MIRROR_SSH_PORT }}
+          MIRROR_SSH_KNOWN_HOSTS: ${{ vars.MIRROR_SSH_KNOWN_HOSTS }}
+          GITCODE_TOKEN: ${{ secrets.GITCODE_RELEASE_TOKEN }}
+          GITCODE_OWNER: ${{ vars.GITCODE_OWNER }}
+          GITCODE_REPO: ${{ vars.GITCODE_REPO }}
+          GITCODE_API_BASE: ${{ vars.GITCODE_API_BASE }}
+          GITCODE_TARGET_COMMITISH: ${{ vars.GITCODE_TARGET_COMMITISH }}
+          FLARE_RELEASE_ACCESS_CLIENT_ID: ${{ secrets.FLARE_RELEASE_ACCESS_CLIENT_ID }}
+          FLARE_RELEASE_ACCESS_CLIENT_SECRET: ${{ secrets.FLARE_RELEASE_ACCESS_CLIENT_SECRET }}
+        run: |
+          set +x
+          set +e
+          set -o pipefail
+          shopt -s nullglob
+          missing=()
+          for name in MIRROR_SSH_KEY MIRROR_SSH_HOST MIRROR_SSH_KNOWN_HOSTS GITCODE_TOKEN GITCODE_OWNER GITCODE_REPO FLARE_RELEASE_ACCESS_CLIENT_ID FLARE_RELEASE_ACCESS_CLIENT_SECRET; do
+            if [ -z "${!name}" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            reason="GitCode mirroring is not configured; missing ${missing[*]}"
+            if [ "$NON_BLOCKING" = "true" ]; then
+              echo "::warning title=GitCode mirror skipped::$reason"
+              exit 0
+            fi
+            echo "::error::$reason"
+            exit 1
+          fi
+
+          apks=(apk/*.apk)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one APK in apk/, found ${#apks[@]}"
+            exit 1
+          fi
+          filename=$(basename "${apks[0]}")
+          # The digest of the artifact that was released: the mirror host must end
+          # up with exactly these bytes.
+          expect=$(sha256sum "${apks[0]}" | cut -d' ' -f1)
+          echo "APK $filename sha256 $expect"
+          # The upload script runs from a root-owned copy on the host; this is the
+          # version this commit expects, and the host refuses any other.
+          script_sha=$(sha256sum scripts/mirror-android-apk-to-gitcode.mjs | cut -d' ' -f1)
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$MIRROR_SSH_KEY" > ~/.ssh/mirror_key
+          chmod 600 ~/.ssh/mirror_key
+          printf '%s\n' "$MIRROR_SSH_KNOWN_HOSTS" > ~/.ssh/mirror_known_hosts
+
+          # Settings are read from the environment by jq, so no secret is ever a
+          # command-line argument.
+          request=$(jq -nc \
+            --arg tag "$RELEASE_TAG" \
+            --arg filename "$filename" \
+            --arg expect "$expect" \
+            --arg scriptSha256 "$script_sha" \
+            --arg prerelease "$PRERELEASE" \
+            --arg source "github-actions:${{ github.repository }}:${{ github.run_id }}" \
+            '{tag: $tag, filename: $filename, expectSha256: $expect, scriptSha256: $scriptSha256, prerelease: ($prerelease == "true"), source: $source,
+              env: ({
+                GITCODE_TOKEN: env.GITCODE_TOKEN,
+                GITCODE_OWNER: env.GITCODE_OWNER,
+                GITCODE_REPO: env.GITCODE_REPO,
+                GITCODE_API_BASE: env.GITCODE_API_BASE,
+                GITCODE_TARGET_COMMITISH: env.GITCODE_TARGET_COMMITISH,
+                FLARE_RELEASE_ACCESS_CLIENT_ID: env.FLARE_RELEASE_ACCESS_CLIENT_ID,
+                FLARE_RELEASE_ACCESS_CLIENT_SECRET: env.FLARE_RELEASE_ACCESS_CLIENT_SECRET
+              } | with_entries(select(.value != null and .value != "")))}')
+
+          mkdir -p gitcode-mirror
+          # One JSON line and nothing else; the forced command on the host validates
+          # it and runs its own installed copy of the upload script.
+          printf '%s\n' "$request" \
+            | timeout 2640 ssh \
+              -i ~/.ssh/mirror_key \
+              -p "${MIRROR_SSH_PORT:-22}" \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile=$HOME/.ssh/mirror_known_hosts \
+              -o ConnectTimeout=30 \
+              -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=6 \
+              "${MIRROR_SSH_USER:-unoscil-mirror}@$MIRROR_SSH_HOST" \
+            | tee gitcode-mirror/ssh.log
+          status=$?
+          sed -n 's/^::provenance:://p' gitcode-mirror/ssh.log | tail -1 > gitcode-mirror/provenance.json || true
+          exit "$status"
+
+      - name: Keep the mirror provenance
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: gitcode-mirror-provenance-${{ inputs.tag_name }}
+          path: gitcode-mirror/provenance.json
+          if-no-files-found: ignore
+
+      - name: Warn that the mirror is missing
+        if: ${{ always() && steps.mirror.outcome == 'failure' }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: |
+          echo "::warning title=GitCode mirror not available::The release is published from GitHub and R2. Users in mainland China are not redirected until the mirror succeeds. Run mirror-android-gitcode with tag $RELEASE_TAG."

@@ -1,0 +1,17 @@
+# Pre: first onboarding page. Post: home ready; persists completed onboarding through UI.
+appId: ${APP_ID}
+---
+- runFlow: ../../assertions/onboarding-visible.yaml
+- tapOn:
+    id: onboarding-next
+- tapOn:
+    id: onboarding-next
+- assertVisible:
+    id: onboarding-scan
+- tapOn:
+    id: onboarding-skip
+- runFlow:
+    when:
+      true: ${typeof NETWORK_ACCEPTANCE !== "undefined" && NETWORK_ACCEPTANCE === "true"}
+    file: ../updates/dismiss.yaml
+- runFlow: ../../assertions/home-ready.yaml

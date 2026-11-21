@@ -1,0 +1,99 @@
+name: build
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to build'
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - android
+          - ios
+      build_number:
+        description: 'iOS dev build only: override CFBundleVersion'
+        required: false
+        type: string
+      upload_testflight:
+        description: 'iOS dev build only: upload to TestFlight without creating a release'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_testflight && 'unoscil-release' || format('unoscil-build-{0}', github.ref) }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    uses: ./.github/workflows/ci-changes.yml
+
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate iOS dev build request
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          UPLOAD_TESTFLIGHT: ${{ inputs.upload_testflight }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          if [ "$PLATFORMS" = "android" ] && { [ -n "$BUILD_NUMBER" ] || [ "$UPLOAD_TESTFLIGHT" = "true" ]; }; then
+            echo "The iOS dev-build inputs need platforms set to both or ios" >&2
+            exit 1
+          fi
+
+  code-style:
+    needs: [prepare]
+    uses: ./.github/workflows/code-style.yml
+
+  android-build:
+    needs: [changes, prepare, code-style, unit-tests]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.platforms != 'ios') }}
+    uses: ./.github/workflows/android-build.yml
+    secrets:
+      BUILD_CACHE_R2_ENDPOINT: ${{ secrets.BUILD_CACHE_R2_ENDPOINT }}
+      BUILD_CACHE_R2_ACCESS_KEY_ID: ${{ secrets.BUILD_CACHE_R2_ACCESS_KEY_ID }}
+      BUILD_CACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
+    with:
+      build_required: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.native_required != 'false' }}
+      validation_passed: ${{ (github.event_name == 'workflow_dispatch' || needs.changes.result == 'success') && needs.prepare.result == 'success' && needs.code-style.result == 'success' && needs.unit-tests.result == 'success' }}
+      build_reason: ${{ github.event_name == 'workflow_dispatch' && 'Manual build requested.' || needs.changes.outputs.reason }}
+
+  unit-tests:
+    needs: [prepare]
+    uses: ./.github/workflows/test.yml
+
+  ios-build-check:
+    if: ${{ always() && github.event_name == 'push' }}
+    needs: [changes, prepare, code-style, unit-tests]
+    uses: ./.github/workflows/ios-build-check.yml
+    secrets:
+      BUILD_CACHE_R2_ENDPOINT: ${{ secrets.BUILD_CACHE_R2_ENDPOINT }}
+      BUILD_CACHE_R2_ACCESS_KEY_ID: ${{ secrets.BUILD_CACHE_R2_ACCESS_KEY_ID }}
+      BUILD_CACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
+    with:
+      build_required: ${{ needs.changes.outputs.native_required != 'false' }}
+      validation_passed: ${{ needs.changes.result == 'success' && needs.prepare.result == 'success' && needs.code-style.result == 'success' && needs.unit-tests.result == 'success' }}
+      build_reason: ${{ needs.changes.outputs.reason }}
+
+  # Manual development builds may optionally upload directly to TestFlight.
+  # Tagged releases have their own entrypoint in release.yml.
+  ios-build:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
+    needs: [prepare, code-style, unit-tests]
+    uses: ./.github/workflows/build-ios.yml
+    secrets: inherit
+    with:
+      build_number: ${{ inputs.build_number }}
+      upload_testflight: ${{ inputs.upload_testflight }}

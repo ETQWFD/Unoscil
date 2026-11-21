@@ -1,0 +1,534 @@
+import {
+  logger,
+  consoleTransport,
+  type ConsoleTransportOptions,
+  type transportFunctionType,
+} from 'react-native-logs';
+import { Paths, Directory, File } from 'expo-file-system';
+import { deleteAsync, StorageAccessFramework } from 'expo-file-system/legacy';
+import { Platform } from 'react-native';
+import { nativeCopyFile, nativeZipFiles } from 'android-util';
+import { getEngineLogFileUris as getNativeEngineLogFileUris } from 'app-group-store';
+import * as Application from 'expo-application';
+import i18n from '@/i18n';
+import { redactLogText, redactLogValue } from './logRedaction';
+import { capturePostHogLog } from './postHogAnalytics';
+
+const LOG_DIR = new Directory(Paths.document, 'logs');
+// Engine writes to <private_data_directory>/logs, which on Android is filesDir/uc-engine.
+// The cache directory is read only for installs whose one-time migration has not run yet.
+const ENGINE_LOG_DIRS = [
+  new Directory(Paths.document, 'uc-engine/logs'),
+  new Directory(Paths.cache, 'uc-engine/logs'),
+];
+const LOG_EXPORT_DIR = new Directory(Paths.cache, 'log_exports');
+const MAX_LOG_DAYS = 3;
+const LOG_EXPORT_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+function listAppLogFiles(): File[] {
+  return LOG_DIR.exists
+    ? LOG_DIR.list().filter(
+        (entry): entry is File => entry instanceof File && entry.name.endsWith('.txt')
+      )
+    : [];
+}
+
+function listEngineLogFiles(): File[] {
+  if (Platform.OS === 'ios') {
+    try {
+      return getNativeEngineLogFileUris().map((uri) => new File(uri));
+    } catch {
+      // Log collection is best-effort; an unavailable native module must
+      // never break app startup or log export.
+      return [];
+    }
+  }
+  return ENGINE_LOG_DIRS.flatMap((directory) =>
+    directory.exists
+      ? directory
+          .list()
+          .filter(
+            (entry): entry is File =>
+              entry instanceof File &&
+              (entry.name.endsWith('.txt') ||
+                /^engine\.\d{4}-\d{2}-\d{2}\.jsonl$/.test(entry.name))
+          )
+      : []
+  );
+}
+
+function listLogFiles(): File[] {
+  return [...listAppLogFiles(), ...listEngineLogFiles()];
+}
+
+// Engine owns the retention and deletion of its own logs.
+function listDeletableLogFiles(): File[] {
+  return listAppLogFiles();
+}
+
+function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function formatLocalDateTime(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  return `${year}-${month}-${day}_${hours}-${minutes}-${seconds}`;
+}
+
+
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+export interface LogConfig {
+  level: LogLevel;
+  enableConsole: boolean;
+}
+
+export interface ExportedLogArchive {
+  uri: string;
+  fileName: string;
+}
+
+export interface AppLogger {
+  debug(...args: unknown[]): void;
+  info(...args: unknown[]): void;
+  warn(...args: unknown[]): void;
+  error(...args: unknown[]): void;
+}
+
+interface CustomTransportOptions {
+  _custom?: string;
+}
+
+const pendingLogWrites = new Set<() => void>();
+const originalConsoleError = console.error.bind(console);
+let fileWriteFailures = 0;
+let callbackFailures = 0;
+let lastFileWriteSucceeded: boolean | null = null;
+let captureStartedAt: string | null = null;
+let levelSince: string | null = null;
+let activeLogTimestamp: Date | null = null;
+
+function scheduleLogWrite(callback: () => void): void {
+  const capturedAt = new Date();
+  const run = () => {
+    if (!pendingLogWrites.delete(run)) return;
+    const previous = activeLogTimestamp;
+    activeLogTimestamp = capturedAt;
+    try { callback(); } catch {
+      callbackFailures += 1;
+      lastFileWriteSucceeded = false;
+    } finally { activeLogTimestamp = previous; }
+  };
+  pendingLogWrites.add(run);
+  if (typeof globalThis.requestIdleCallback === 'function') globalThis.requestIdleCallback(run, {timeout: 100});
+  else setTimeout(run, 0);
+}
+
+export function flushAppLogs(): Promise<boolean> {
+  const failuresBefore = fileWriteFailures + callbackFailures;
+  const deadline = Date.now() + 1_000;
+  for (const run of [...pendingLogWrites]) {
+    if (Date.now() >= deadline) return Promise.resolve(false);
+    run();
+  }
+  return Promise.resolve(pendingLogWrites.size === 0 && failuresBefore === fileWriteFailures + callbackFailures);
+}
+
+export function getAppLogCaptureStatus() {
+  return {
+    policy: 'redacted-app-text-v1', enabled: isInitialized,
+    effectiveLevel: isInitialized ? currentLogLevel : null,
+    startedAt: captureStartedAt, levelSince, capturedAt: new Date().toISOString(),
+    writerStatus: lastFileWriteSucceeded === null ? 'notObserved' : lastFileWriteSucceeded ? 'ready' : 'unavailable',
+    pendingRecords: pendingLogWrites.size,
+    droppedRecords: fileWriteFailures + callbackFailures, writeFailures: fileWriteFailures,
+    filteredRecordCount: null, counterScope: 'currentCaptureSession', retentionDays: MAX_LOG_DAYS,
+    historicalPolicy: 'notRecorded',
+  };
+}
+
+let isInitialized = false;
+const LOG_SEVERITY = { debug: 0, info: 1, warn: 2, error: 3 };
+let currentLogLevel: LogLevel = __DEV__ ? 'debug' : 'info';
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let logInstance: any = null;
+const scopedLoggers = new Map<string, AppLogger>();
+
+const redactingConsoleTransport: transportFunctionType<ConsoleTransportOptions> = (props) => {
+  consoleTransport({
+    ...props,
+    msg: redactLogText(props.msg),
+    rawMsg: redactLogValue(props.rawMsg),
+  });
+};
+
+/** 导出仅用于单测（append-only 回归锁定）；运行时经由 createLogger 使用 */
+export const customFileTransport = (props: {
+  msg: string;
+  rawMsg: unknown;
+  level: { severity: number; text: string };
+  extension?: string | null;
+  options?: CustomTransportOptions;
+}): void => {
+  try {
+    if (!LOG_DIR.exists) {
+      LOG_DIR.create();
+    }
+
+    const today = activeLogTimestamp ?? new Date();
+    const dateStr = formatLocalDate(today);
+    const fileName = `app_${dateStr}.txt`;
+    const logFile = new File(LOG_DIR, fileName);
+
+    const timestamp = today.toISOString();
+    const level = props.level.text.toUpperCase();
+    const extension = props.extension ? ` [${props.extension}]` : '';
+    const message = redactLogText(props.msg);
+
+    const logLine = `${timestamp} ${level}${extension}: ${message}\n`;
+
+    // 必须追加写。整读整写是 O(文件大小) 的同步 JS 阻塞，文件到数 MB 后
+    // 每条日志都会冻结 JS 线程 100ms+（见 Logger.appendOnly.test.ts）
+    logFile.write(logLine, { append: true });
+    lastFileWriteSucceeded = true;
+  } catch {
+    fileWriteFailures += 1;
+    lastFileWriteSucceeded = false;
+    // Never feed a failed file write back through the patched logging console.
+    originalConsoleError('Failed to write log file');
+  }
+};
+
+export function initLogger(config?: Partial<LogConfig>): void {
+  if (isInitialized) {
+    return;
+  }
+
+  const logConfig = {
+    level: config?.level ?? (__DEV__ ? 'debug' : 'info'),
+    enableConsole: config?.enableConsole ?? true,
+  };
+  currentLogLevel = logConfig.level;
+  captureStartedAt = new Date().toISOString();
+  levelSince = captureStartedAt;
+
+  const transports = logConfig.enableConsole
+    ? [redactingConsoleTransport, customFileTransport]
+    : [customFileTransport];
+
+  logInstance = logger.createLogger({
+    levels: {
+      debug: 0,
+      info: 1,
+      warn: 2,
+      error: 3,
+    },
+    severity: logConfig.level,
+    transport: transports,
+    async: true,
+    asyncFunc: scheduleLogWrite,
+    dateFormat: 'iso',
+    printLevel: true,
+    printDate: true,
+  });
+
+  logInstance.patchConsole();
+  isInitialized = true;
+
+  cleanOldLogs();
+  if (Platform.OS === 'android') {
+    cleanExportedLogArchives();
+  }
+  logSystemInfo();
+  logEngineLogSummary();
+}
+
+function logEngineLogSummary(): void {
+  const files = listEngineLogFiles();
+  if (files.length === 0) return;
+  logInstance.info(
+    `Engine log files: ${files.length} (${files.map((file) => file.name).join(', ')})`
+  );
+}
+
+function logSystemInfo(): void {
+  if (Platform.OS !== 'android') return;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c = (Platform as any).constants;
+  const appVersion = Application.nativeApplicationVersion ?? 'unknown';
+  const buildVersion = Application.nativeBuildVersion ?? 'unknown';
+  const androidRelease: string = c?.Release ?? 'unknown';
+  const apiLevel: number = Platform.Version as number;
+  const model: string = c?.Model ?? 'unknown';
+  const manufacturer: string = c?.manufacturer ?? 'unknown';
+  logInstance.info(
+    `App started | version: ${appVersion} (build ${buildVersion}) | ` +
+      `Android ${androidRelease} (API ${apiLevel}) | ${manufacturer} ${model}`
+  );
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getLogger(): any {
+  if (!logInstance) {
+    initLogger();
+  }
+  return logInstance;
+}
+
+export function setLogLevel(level: LogLevel): void {
+  if (currentLogLevel !== level) levelSince = new Date().toISOString();
+  currentLogLevel = level;
+  if (logInstance) {
+    logInstance.setSeverity(level);
+  }
+}
+
+export function getLogDirectory(): Directory {
+  return LOG_DIR;
+}
+
+export function getLogFilePaths(): string[] {
+  return listLogFiles().map((file) => file.uri);
+}
+
+export function calculateLogSize(): number {
+  let totalSize = 0;
+
+  for (const entry of listLogFiles()) {
+    try {
+      const info = entry.info();
+      totalSize += info.size || 0;
+    } catch {
+      // ignore
+    }
+  }
+
+  return totalSize;
+}
+
+export function clearLogs(): void {
+  for (const entry of listDeletableLogFiles()) {
+    try {
+      entry.delete();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export function cleanOldLogs(): void {
+  const today = new Date();
+  const cutoffDate = new Date(today);
+  cutoffDate.setDate(cutoffDate.getDate() - MAX_LOG_DAYS);
+
+  for (const entry of listDeletableLogFiles()) {
+    const match = entry.name.match(/^app_(\d{4}-\d{2}-\d{2})\.txt$/);
+    if (match) {
+      const fileDate = new Date(match[1]);
+      if (fileDate < cutoffDate) {
+        try {
+          entry.delete();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+}
+
+function writeLog(
+  level: keyof Pick<AppLogger, 'debug' | 'info' | 'warn' | 'error'>,
+  source: string,
+  args: unknown[]
+): void {
+  const prefix = `[${source}]`;
+  const values =
+    typeof args[0] === 'string' ? [`${prefix} ${args[0]}`, ...args.slice(1)] : [prefix, ...args];
+  const value = values.length === 1 ? values[0] : values;
+
+  getLogger()[level](redactLogValue(value));
+  if (LOG_SEVERITY[level] >= LOG_SEVERITY[currentLogLevel]) {
+    capturePostHogLog(level, source, args);
+  }
+}
+
+export function createLogger(source: string): AppLogger {
+  const normalizedSource = source.trim();
+  if (!normalizedSource) {
+    throw new Error('Logger source is required');
+  }
+
+  const existing = scopedLoggers.get(normalizedSource);
+  if (existing) return existing;
+
+  const scopedLogger: AppLogger = {
+    debug: (...args) => writeLog('debug', normalizedSource, args),
+    info: (...args) => writeLog('info', normalizedSource, args),
+    warn: (...args) => writeLog('warn', normalizedSource, args),
+    error: (...args) => writeLog('error', normalizedSource, args),
+  };
+  scopedLoggers.set(normalizedSource, scopedLogger);
+  return scopedLogger;
+}
+
+export function getLogFileUris(): string[] {
+  return listLogFiles().map((file) => file.uri);
+}
+
+export function getAppLogFileUris(): string[] {
+  return listAppLogFiles().map((file) => file.uri);
+}
+
+export function getEngineLogFileUris(): string[] {
+  return listEngineLogFiles().map((file) => file.uri);
+}
+
+function createExportAbortError(): Error {
+  const error = new Error('Log export was aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function throwIfExportAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createExportAbortError();
+  }
+}
+
+function cleanExportedLogArchives(now = Date.now()): void {
+  if (!LOG_EXPORT_DIR.exists) return;
+
+  for (const entry of LOG_EXPORT_DIR.list()) {
+    if (
+      !(entry instanceof File) ||
+      !entry.name.startsWith('logs_') ||
+      !entry.name.endsWith('.zip')
+    ) {
+      continue;
+    }
+    if (entry.lastModified === null || now - entry.lastModified >= LOG_EXPORT_RETENTION_MS) {
+      entry.delete();
+    }
+  }
+}
+
+function getExportableLogFileUris(): string[] {
+  const fileUris = getLogFileUris();
+  if (fileUris.length === 0) {
+    throw new Error(i18n.t('errors:log.noFilesToExport'));
+  }
+  return fileUris;
+}
+
+async function createLogArchiveFromFiles(
+  fileUris: string[],
+  signal?: AbortSignal
+): Promise<ExportedLogArchive> {
+  const timestamp = formatLocalDateTime(new Date());
+  const fileName = `logs_${timestamp}.zip`;
+
+  if (!LOG_EXPORT_DIR.exists) {
+    LOG_EXPORT_DIR.create();
+  }
+  const archive = new File(LOG_EXPORT_DIR, fileName);
+  const sanitizedDirectory = new Directory(LOG_EXPORT_DIR, `sanitized_${timestamp}_${Date.now()}`);
+  if (archive.exists) {
+    archive.delete();
+  }
+
+  try {
+    throwIfExportAborted(signal);
+    sanitizedDirectory.create({ intermediates: true });
+    const sanitizedFileUris: string[] = [];
+    for (const fileUri of fileUris) {
+      throwIfExportAborted(signal);
+      const source = new File(fileUri);
+      const sanitizedFile = new File(sanitizedDirectory, source.name);
+      sanitizedFile.write(redactLogText(await source.text()));
+      sanitizedFileUris.push(sanitizedFile.uri);
+    }
+    throwIfExportAborted(signal);
+    await nativeZipFiles(sanitizedFileUris, archive.uri, signal);
+    throwIfExportAborted(signal);
+    return { uri: archive.uri, fileName };
+  } catch (error) {
+    if (archive.exists) {
+      archive.delete();
+    }
+    throw error;
+  } finally {
+    try {
+      if (sanitizedDirectory.exists) sanitizedDirectory.delete();
+    } catch {
+      // Temporary sanitized files contain no credentials; cache cleanup remains best-effort.
+    }
+  }
+}
+
+export function createLogArchive(signal?: AbortSignal): Promise<ExportedLogArchive> {
+  if (Platform.OS !== 'android') {
+    throw new Error('createLogArchive is only supported on Android');
+  }
+
+  cleanExportedLogArchives();
+  return createLogArchiveFromFiles(getExportableLogFileUris(), signal);
+}
+
+export async function saveLogsToFile(signal?: AbortSignal): Promise<void> {
+  if (Platform.OS !== 'android') {
+    throw new Error('saveLogsToFile is only supported on Android');
+  }
+
+  const fileUris = getExportableLogFileUris();
+  cleanExportedLogArchives();
+  const permissions = await StorageAccessFramework.requestDirectoryPermissionsAsync();
+  if (!permissions.granted) {
+    throw createExportAbortError();
+  }
+
+  let archive: ExportedLogArchive | null = null;
+  let destUri: string | null = null;
+  try {
+    archive = await createLogArchiveFromFiles(fileUris, signal);
+    throwIfExportAborted(signal);
+    destUri = await StorageAccessFramework.createFileAsync(
+      permissions.directoryUri,
+      archive.fileName,
+      'application/zip'
+    );
+    await nativeCopyFile(archive.uri, destUri);
+    throwIfExportAborted(signal);
+  } catch (error) {
+    if (destUri) {
+      try {
+        await deleteAsync(destUri, { idempotent: true });
+      } catch {
+        // Preserve the original export error if the document provider cannot delete the partial file.
+      }
+    }
+    throw error;
+  } finally {
+    if (archive) {
+      deleteExportedLogArchive(archive.uri);
+    }
+  }
+}
+
+export function deleteExportedLogArchive(fileUri: string): void {
+  const archive = new File(fileUri);
+  if (archive.exists) {
+    archive.delete();
+  }
+}
+
+export function scheduleExportedLogArchiveCleanup(fileUri: string): void {
+  setTimeout(() => deleteExportedLogArchive(fileUri), LOG_EXPORT_RETENTION_MS);
+}

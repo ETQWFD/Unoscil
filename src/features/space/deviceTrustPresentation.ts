@@ -1,0 +1,664 @@
+import type {
+  DeviceCompatibility,
+  DeviceGroupRelationship,
+  DeviceGroupChoiceIssue,
+  DeviceGroupUpdate,
+  DeviceMembership,
+  DeviceReachability,
+  DeviceSyncRelationship,
+  DeviceTrustChoice,
+  DeviceTrustImpact,
+  DeviceTrustSnapshot,
+  DeviceTrustUnavailableReason,
+} from '@/platform/engine';
+import type {
+  DeviceListRefreshStatus,
+  DeviceTrustQueryState,
+  SpaceOperationContext,
+  SpaceOperationDevice,
+  SpaceOperationKind,
+  SpaceOperationResult,
+  SpaceOperationState,
+  UnifiedSpaceDevice,
+  UnifiedSpaceStatus,
+} from './store';
+
+export type DeviceTrustPrimaryStatus =
+  | 'waitingForLocalDecision'
+  | 'unverifiable'
+  | 'upgradeRequired'
+  | 'differentSpace'
+  | 'removed'
+  | 'removalAcknowledgementPending'
+  | 'updating'
+  | 'pairingAwaitingConfirmation'
+  | 'pairingUnconfirmed'
+  | 'groupUpdatePending'
+  | 'groupUpdateRejected'
+  | 'usable'
+  | 'unknown';
+
+export interface DeviceTrustChoiceView {
+  choice: DeviceTrustChoice;
+  isCurrentGroup?: boolean;
+  membersComplete?: boolean;
+  exitsCurrentSpace: boolean;
+  continueSyncNames: string[];
+  stopSyncNames: string[];
+  requiresRejoinNames: string[];
+  pendingConfirmationNames?: string[];
+}
+
+export interface DeviceTrustDecisionView {
+  changeId: string;
+  isGroupChoice?: boolean;
+  reviewId?: string;
+  sourceName: string;
+  targetNames: string[];
+  choices: DeviceTrustChoiceView[];
+  reasonLines?: { key: string; values?: Record<string, string> }[];
+}
+
+export interface DeviceTrustDeviceView {
+  deviceId: string;
+  displayName: string;
+  isLocal: boolean;
+  reachability: DeviceReachability;
+  membership: DeviceMembership;
+  groupRelationship: DeviceGroupRelationship;
+  compatibility: DeviceCompatibility;
+  syncRelationship: DeviceSyncRelationship;
+  primaryStatus: DeviceTrustPrimaryStatus;
+  // Engine's unconfirmed group key update for this device; null when nothing is pending.
+  groupUpdate: DeviceGroupUpdate | null;
+  canSync: boolean;
+  canRemove: boolean;
+  canUpdateThisDevice: boolean;
+  blockedReason: DeviceTrustUnavailableReason | null;
+}
+
+export type SpaceOverviewPrimaryStatus =
+  | 'decisionRequired'
+  | 'unverifiable'
+  | 'updateRequired'
+  | 'updating'
+  | 'refreshing'
+  | 'healthy'
+  | 'maintenanceRetrying'
+  | 'maintenanceNeedsAttention'
+  | 'empty';
+
+export interface SpaceOverviewView {
+  memberCount: number;
+  primaryStatus: SpaceOverviewPrimaryStatus;
+  hasPendingDecision: boolean;
+  // True only while nothing settled can be shown yet. A background refresh over a settled
+  // snapshot keeps presenting that snapshot, so the overview does not flicker on every refresh.
+  isLoading: boolean;
+  // The join that started a holistic space device update is still running; the overview links to it.
+  deviceUpdateInProgress: boolean;
+  spaceDeviceUpdate: DeviceTrustSnapshot['spaceDeviceUpdate'] | null;
+  // Devices that still owe a group key update, in device order.
+  groupUpdateDevices: { displayName: string; groupUpdate: DeviceGroupUpdate }[];
+  maintenanceHealth: NonNullable<DeviceTrustSnapshot['maintenanceHealth']> | null;
+}
+
+export function deviceTrustSnapshotFromQuery(
+  query: DeviceTrustQueryState
+): DeviceTrustSnapshot | null {
+  if (query.kind === 'ready') return query.snapshot;
+  if (query.kind === 'loading') return query.previous;
+  return null;
+}
+
+// A refresh keeps the previous snapshot on screen; actions stay available until a newer result replaces it.
+export function hasSettledDeviceTrust(query: DeviceTrustQueryState): boolean {
+  return deviceTrustSnapshotFromQuery(query) !== null;
+}
+
+function displayNames(snapshot: DeviceTrustSnapshot): Map<string, string> {
+  const devices = new Map(snapshot.devices.map((device) => [device.deviceId, device]));
+  const extraDevices =
+    snapshot.groupChoices?.issues.flatMap((issue) => [
+      ...(issue.reason?.changes.flatMap((change) => [change.actor, change.target]) ?? []),
+      ...(issue.reason?.decisions.flatMap((decision) => [decision.device, decision.target]) ??
+        []),
+      ...issue.choices.flatMap((choice) => choice.members ?? []),
+    ]) ?? [];
+  const labels = new Map<string, { deviceId: string; displayName: string }>(devices);
+  for (const device of extraDevices) {
+    if (!devices.has(device.deviceId)) labels.set(device.deviceId, device);
+  }
+  const counts = new Map<string, number>();
+  for (const device of labels.values()) {
+    counts.set(device.displayName, (counts.get(device.displayName) ?? 0) + 1);
+  }
+  return new Map(
+    [...labels.values()].map((device) => [
+      device.deviceId,
+      counts.get(device.displayName) === 1
+        ? device.displayName
+        : `${device.displayName} · ${device.deviceId.slice(-8)}`,
+    ])
+  );
+}
+
+function names(ids: string[], labels: Map<string, string>): string[] {
+  return ids.map((id) => labels.get(id) ?? id.slice(-8));
+}
+
+function choiceView(
+  choice: DeviceTrustChoice,
+  impact: DeviceTrustImpact,
+  labels: Map<string, string>,
+  localDeviceId: string
+): DeviceTrustChoiceView {
+  const remoteNames = (ids: string[]) =>
+    names(
+      ids.filter((id) => id !== localDeviceId),
+      labels
+    );
+  return {
+    choice,
+    exitsCurrentSpace: impact.localDeviceOutcome === 'removed',
+    continueSyncNames: remoteNames(impact.usableDeviceIds),
+    stopSyncNames: remoteNames(impact.pausedDeviceIds),
+    requiresRejoinNames: remoteNames(impact.requiresRejoinDeviceIds),
+  };
+}
+
+function groupReasonLines(
+  issue: DeviceGroupChoiceIssue,
+  labels: Map<string, string>
+): DeviceTrustDecisionView['reasonLines'] {
+  const reason = issue.reason;
+  if (!reason) return undefined;
+  const lines: NonNullable<DeviceTrustDecisionView['reasonLines']> = [
+    { key: `space.deviceTrust.reason.${reason.kind}` },
+  ];
+  for (const change of reason.changes) {
+    lines.push({
+      key: `space.deviceTrust.reason.${change.kind}`,
+      values: {
+        actor: names([change.actor.deviceId], labels)[0],
+        target: names([change.target.deviceId], labels)[0],
+      },
+    });
+  }
+  for (const decision of reason.decisions) {
+    lines.push({
+      key: `space.deviceTrust.reason.${decision.decision}`,
+      values: {
+        actor: names([decision.device.deviceId], labels)[0],
+        target: names([decision.target.deviceId], labels)[0],
+      },
+    });
+  }
+  if (!reason.detailsComplete) lines.push({ key: 'space.deviceTrust.reason.incomplete' });
+  return lines;
+}
+
+export function buildDeviceTrustDecisionView(
+  snapshot: DeviceTrustSnapshot | null
+): DeviceTrustDecisionView | null {
+  const issue = snapshot?.groupChoices?.issues[0];
+  if (snapshot?.groupChoices) {
+    if (!issue) return null;
+    const labels = displayNames(snapshot);
+    const remoteNames = (ids: string[]) =>
+      names(ids.filter((id) => id !== snapshot.localDeviceId), labels);
+    return {
+      changeId: issue.issueId,
+      reviewId: JSON.stringify([issue.issueId, snapshot.groupChoices.revision]),
+      isGroupChoice: true,
+      reasonLines: groupReasonLines(issue, labels),
+      sourceName: '',
+      targetNames: [],
+      choices: issue.choices.map((option) =>
+        option.impact !== undefined
+          ? {
+              choice: option.choiceId,
+              isCurrentGroup: option.isCurrentGroup,
+              membersComplete: option.membersComplete && option.impact !== null,
+              exitsCurrentSpace:
+                option.requiresRePairing || option.impact?.localDeviceOutcome === 'removed',
+              continueSyncNames: remoteNames(
+                (option.impact?.syncScopeDeviceIds ?? []).filter(
+                  (id) => !option.impact?.pendingConfirmationDeviceIds.includes(id)
+                )
+              ),
+              stopSyncNames: remoteNames(option.impact?.pausedDeviceIds ?? []),
+              requiresRejoinNames: remoteNames(option.impact?.requiresRejoinDeviceIds ?? []),
+              pendingConfirmationNames: remoteNames(
+                option.impact?.pendingConfirmationDeviceIds ?? []
+              ),
+            }
+          : {
+              choice: option.choiceId,
+              isCurrentGroup: option.isCurrentGroup,
+              membersComplete: option.membersComplete,
+              exitsCurrentSpace: option.requiresRePairing,
+              continueSyncNames: names(
+                option.memberDeviceIds.filter((id) => id !== snapshot.localDeviceId),
+                labels
+              ),
+              stopSyncNames: option.membersComplete
+                ? names(
+                    snapshot.devices
+                      .filter(
+                        (device) =>
+                          !device.isLocal &&
+                          device.membership !== 'removed' &&
+                          !option.memberDeviceIds.includes(device.deviceId)
+                      )
+                      .map((device) => device.deviceId),
+                    labels
+                  )
+                : [],
+              requiresRejoinNames: [],
+            }
+      ),
+    };
+  }
+  const change = snapshot?.currentChange;
+  if (!snapshot || !change) return null;
+  const labels = displayNames(snapshot);
+  return {
+    changeId: change.changeId,
+    sourceName: labels.get(change.proposedByDeviceId) ?? change.proposedByDeviceId.slice(-8),
+    targetNames: names(change.targetDeviceIds, labels),
+    choices: change.allowedChoices.map((choice) =>
+      choiceView(
+        choice,
+        choice === 'applyChange' ? change.applyImpact : change.keepCurrentImpact,
+        labels,
+        snapshot.localDeviceId
+      )
+    ),
+  };
+}
+
+export function initialDeviceTrustChoice(
+  snapshot: DeviceTrustSnapshot | null,
+  previousChangeId: string | null,
+  previousChoice: DeviceTrustChoice | null
+): { changeId: string | null; choice: DeviceTrustChoice | null } {
+  const view = buildDeviceTrustDecisionView(snapshot);
+  if (!view) return { changeId: null, choice: null };
+  const reviewId = view.reviewId ?? view.changeId;
+  if (
+    reviewId === previousChangeId &&
+    previousChoice &&
+    view.choices.some((choice) => choice.choice === previousChoice)
+  ) {
+    return { changeId: reviewId, choice: previousChoice };
+  }
+  return {
+    changeId: reviewId,
+    choice: view.choices.length === 1 ? view.choices[0]?.choice ?? null : null,
+  };
+}
+
+function primaryStatus(sync: DeviceSyncRelationship): DeviceTrustPrimaryStatus {
+  switch (sync) {
+    case 'waitingForLocalDecision':
+      return 'waitingForLocalDecision';
+    case 'pausedUnverifiable':
+      return 'unverifiable';
+    case 'pausedUpgradeRequired':
+      return 'upgradeRequired';
+    case 'pausedGroupDiverged':
+      return 'differentSpace';
+    case 'removedLocalDevice':
+    case 'removedPeerDevice':
+      return 'removed';
+    case 'usable':
+      return 'usable';
+    case 'unknown':
+      return 'unknown';
+  }
+}
+
+function devicePrimaryStatus(
+  device: DeviceTrustSnapshot['devices'][number]
+): DeviceTrustPrimaryStatus {
+  if (device.groupRelationship === 'awaitingRemovalAcknowledgement') {
+    return 'removalAcknowledgementPending';
+  }
+  const syncStatus = primaryStatus(device.syncRelationship);
+  if (syncStatus !== 'usable' && syncStatus !== 'unknown') return syncStatus;
+  const update = device.groupUpdate;
+  if (update) {
+    return update.state === 'waiting' || update.state === 'receiverUnavailable'
+      ? 'groupUpdatePending'
+      : 'groupUpdateRejected';
+  }
+  if (device.pairingConfirmation === 'awaitingPeerConfirmation') {
+    return 'pairingAwaitingConfirmation';
+  }
+  if (device.pairingConfirmation === 'unconfirmed') return 'pairingUnconfirmed';
+  return device.groupRelationship === 'confirmationPending' ? 'updating' : syncStatus;
+}
+
+export function buildDeviceTrustDeviceViews(
+  snapshot: DeviceTrustSnapshot | null,
+  fallbackDevices: UnifiedSpaceDevice[]
+): DeviceTrustDeviceView[] {
+  if (!snapshot) {
+    return fallbackDevices.map((device) => ({
+      deviceId: device.deviceId,
+      displayName: device.displayName,
+      isLocal: device.isLocal,
+      reachability: device.isLocal || device.online ? 'online' : 'offline',
+      membership: 'unavailable',
+      groupRelationship: 'unverifiable',
+      compatibility: 'unknown',
+      syncRelationship: 'pausedUnverifiable',
+      primaryStatus: 'unverifiable',
+      groupUpdate: null,
+      canSync: false,
+      canRemove: false,
+      canUpdateThisDevice: false,
+      blockedReason: 'engineUnavailable',
+    }));
+  }
+  const labels = displayNames(snapshot);
+  const hasPendingDecision = buildDeviceTrustDecisionView(snapshot) !== null;
+  return snapshot.devices
+    .filter(
+      (device) => {
+        if (device.groupRelationship === 'awaitingRemovalAcknowledgement') return true;
+        return (
+          device.membership !== 'removed' &&
+          device.groupRelationship !== 'diverged' &&
+          device.syncRelationship !== 'pausedGroupDiverged' &&
+          device.syncRelationship !== 'removedLocalDevice' &&
+          device.syncRelationship !== 'removedPeerDevice'
+        );
+      }
+    )
+    .map((device) => ({
+      deviceId: device.deviceId,
+      displayName: labels.get(device.deviceId) ?? device.displayName,
+      isLocal: device.isLocal,
+      reachability: device.reachability,
+      membership: device.membership,
+      groupRelationship: device.groupRelationship,
+      compatibility: device.compatibility,
+      syncRelationship: device.syncRelationship,
+      primaryStatus: devicePrimaryStatus(device),
+      groupUpdate: device.groupUpdate ?? null,
+      canSync:
+        device.groupRelationship !== 'confirmationPending' && device.syncRelationship === 'usable',
+      canRemove:
+        !device.isLocal &&
+        device.membership === 'active' &&
+        device.groupRelationship === 'consistent' &&
+        device.blockedReason === null &&
+        !hasPendingDecision,
+      canUpdateThisDevice: device.isLocal && device.availableActions.includes('updateThisDevice'),
+      blockedReason: device.blockedReason,
+    }));
+}
+
+export function buildCurrentSpaceDeviceViews(
+  query: DeviceTrustQueryState,
+  rosterDevices: UnifiedSpaceDevice[],
+  operationState: SpaceOperationState = { kind: 'idle' }
+): DeviceTrustDeviceView[] {
+  const snapshot = deviceTrustSnapshotFromQuery(query);
+  if (snapshot?.localMembership === 'removed') return [];
+  const views = buildDeviceTrustDeviceViews(snapshot, rosterDevices);
+  return views.map((view) => ({
+    ...view,
+    primaryStatus:
+      operationState.kind === 'submitting' &&
+      (view.primaryStatus === 'usable' || view.primaryStatus === 'unknown')
+        ? 'updating'
+        : view.primaryStatus,
+    canRemove: hasSettledDeviceTrust(query) && operationState.kind === 'idle' ? view.canRemove : false,
+  }));
+}
+
+export function buildSpaceOverviewView(
+  spaceStatus: UnifiedSpaceStatus,
+  query: DeviceTrustQueryState,
+  deviceListRefreshStatus: DeviceListRefreshStatus,
+  rosterDevices: UnifiedSpaceDevice[] = [],
+  operationState: SpaceOperationState = { kind: 'idle' }
+): SpaceOverviewView {
+  const snapshot = deviceTrustSnapshotFromQuery(query);
+  const devices = buildCurrentSpaceDeviceViews(query, rosterDevices, operationState);
+  const hasPendingDecision = buildDeviceTrustDecisionView(snapshot) !== null;
+  const isLoading =
+    snapshot === null &&
+    (query.kind === 'loading' ||
+      query.kind === 'idle' ||
+      deviceListRefreshStatus === 'refreshing' ||
+      spaceStatus === 'loading');
+  let primaryStatus: SpaceOverviewPrimaryStatus;
+
+  if (
+    spaceStatus === 'empty' ||
+    query.kind === 'notApplicable' ||
+    snapshot?.localMembership === 'removed'
+  ) {
+    primaryStatus = 'empty';
+  } else if (snapshot?.spaceDeviceUpdate?.phase === 'needsAttention') {
+    primaryStatus = 'maintenanceNeedsAttention';
+  } else if (snapshot?.spaceDeviceUpdate?.phase === 'retryableFailure') {
+    primaryStatus = 'maintenanceRetrying';
+  } else if (snapshot?.spaceDeviceUpdate?.phase === 'updating') {
+    primaryStatus = 'refreshing';
+  } else if (hasPendingDecision) {
+    primaryStatus = 'decisionRequired';
+  } else if (
+    query.kind === 'unavailable' ||
+    query.kind === 'failed' ||
+    query.kind === 'corrupt' ||
+    devices.some((device) => device.syncRelationship === 'pausedUnverifiable')
+  ) {
+    primaryStatus = 'unverifiable';
+  } else if (
+    devices.some(
+      (device) =>
+        device.compatibility === 'upgradeRequired' ||
+        device.syncRelationship === 'pausedUpgradeRequired'
+    )
+  ) {
+    primaryStatus = 'updateRequired';
+  } else if (
+    operationState.kind === 'submitting' ||
+    devices.some((device) => device.groupRelationship === 'confirmationPending')
+  ) {
+    primaryStatus = 'updating';
+  } else if (snapshot === null) {
+    // Only idle or a first load reach here; every failed query kind was handled above.
+    primaryStatus = 'refreshing';
+  } else {
+    primaryStatus = 'healthy';
+  }
+
+  return {
+    memberCount: devices.filter((device) => device.membership !== 'removed').length,
+    primaryStatus,
+    hasPendingDecision,
+    isLoading,
+    deviceUpdateInProgress:
+      snapshot !== null &&
+      snapshot.currentJoin?.type === 'active' &&
+      snapshot.spaceDeviceUpdate.phase !== 'completed',
+    spaceDeviceUpdate: snapshot?.spaceDeviceUpdate ?? null,
+    groupUpdateDevices: devices.flatMap((device) =>
+      device.groupUpdate ? [{ displayName: device.displayName, groupUpdate: device.groupUpdate }] : []
+    ),
+    maintenanceHealth: snapshot?.maintenanceHealth ?? null,
+  };
+}
+
+// A review action exists only when Engine names a recovery; otherwise the sheet can only close.
+export function spaceDeviceUpdateOffersReview(
+  update: DeviceTrustSnapshot['spaceDeviceUpdate']
+): boolean {
+  return update.recovery !== null;
+}
+
+// Engine owns every retry: the message names the devices but never offers a manual recheck.
+export function spaceMaintenanceMessage(
+  overview: SpaceOverviewView,
+  t: (key: string, options?: Record<string, string>) => string
+): string | null {
+  const pending = overview.groupUpdateDevices ?? [];
+  const deviceNames = (devices: typeof pending) =>
+    devices.map((device) => device.displayName).join(', ');
+  if (overview.primaryStatus === 'maintenanceRetrying') {
+    // Only updates Engine retries on its own backoff may be described as retried automatically.
+    const retrying = pending.filter((device) => device.groupUpdate.recovery === 'automatic');
+    if (retrying.length) {
+      return t('space.overview.groupUpdateRetrying', { devices: deviceNames(retrying) });
+    }
+    const retryAt = overview.spaceDeviceUpdate?.nextRetryAtMs;
+    return retryAt == null
+      ? t('space.overview.maintenanceWaiting')
+      : t('space.overview.maintenanceRetryAt', { time: new Date(retryAt).toLocaleString() });
+  }
+  if (overview.primaryStatus === 'maintenanceNeedsAttention') {
+    if (overview.spaceDeviceUpdate?.reason === 'localIdentityMismatch') {
+      return t('space.overview.localIdentityMismatch');
+    }
+    const review = pending.filter((device) => device.groupUpdate.recovery === 'reviewDevice');
+    return review.length
+      ? t('space.overview.groupUpdateNeedsReview', { devices: deviceNames(review) })
+      : t('space.overview.maintenanceAction');
+  }
+  return null;
+}
+
+// The guidance follows Engine's recovery, not the delivery state.
+export function deviceGroupUpdateGuidance(update: DeviceGroupUpdate): string {
+  return `space.deviceDetail.groupUpdate.recovery.${update.recovery}`;
+}
+
+// Label/value rows shared by both platform device details.
+export function deviceGroupUpdateRows(
+  update: DeviceGroupUpdate,
+  t: (key: string) => string
+): { key: string; label: string; value: string }[] {
+  const rows = [
+    {
+      key: 'state',
+      label: t('space.deviceDetail.groupUpdate.label'),
+      value: t(`space.deviceDetail.groupUpdate.state.${update.state}`),
+    },
+    { key: 'epoch', label: t('space.deviceDetail.groupUpdate.epoch'), value: String(update.epoch) },
+    {
+      key: 'attempts',
+      label: t('space.deviceDetail.groupUpdate.attempts'),
+      value: String(update.attempts),
+    },
+  ];
+  if (update.recovery === 'automatic' && update.nextRetryAtMs !== null) {
+    rows.push({
+      key: 'nextRetry',
+      label: t('space.deviceDetail.groupUpdate.nextRetry'),
+      value: new Date(update.nextRetryAtMs).toLocaleString(),
+    });
+  }
+  return rows;
+}
+
+function operationDevice(device: DeviceTrustDeviceView): SpaceOperationDevice {
+  return {
+    deviceId: device.deviceId,
+    displayName: device.displayName,
+    isLocal: device.isLocal,
+    reachability: device.reachability,
+  };
+}
+
+export function buildSpaceOperationContext(
+  kind: SpaceOperationKind,
+  spaceId: string | null,
+  query: DeviceTrustQueryState,
+  rosterDevices: UnifiedSpaceDevice[],
+  targetDeviceId: string | null = null
+): SpaceOperationContext {
+  const snapshot = deviceTrustSnapshotFromQuery(query);
+  const beforeDevices = buildCurrentSpaceDeviceViews(query, rosterDevices).map(operationDevice);
+  if (targetDeviceId && !beforeDevices.some((device) => device.deviceId === targetDeviceId)) {
+    const target = rosterDevices.find((device) => device.deviceId === targetDeviceId);
+    if (target) {
+      beforeDevices.push({
+        deviceId: target.deviceId,
+        displayName: target.displayName,
+        isLocal: target.isLocal,
+        reachability: target.isLocal || target.online ? 'online' : 'offline',
+      });
+    }
+  }
+  return {
+    kind,
+    spaceId,
+    targetDeviceId,
+    localDeviceId:
+      snapshot?.localDeviceId ?? rosterDevices.find((device) => device.isLocal)?.deviceId ?? null,
+    beforeDevices,
+  };
+}
+
+export function buildSpaceOperationResult(
+  context: SpaceOperationContext,
+  query: DeviceTrustQueryState,
+  rosterDevices: UnifiedSpaceDevice[],
+  verification: SpaceOperationResult['verification'],
+  decisionOutcome: SpaceOperationResult['decisionOutcome'] = null
+): SpaceOperationResult {
+  if (context.kind === 'leaveSpace') {
+    const local = context.beforeDevices.filter((device) => device.isLocal);
+    const continuing = context.beforeDevices.filter((device) => !device.isLocal);
+    return {
+      kind: context.kind,
+      spaceId: context.spaceId,
+      targetDeviceId: null,
+      localDeviceInSpace: false,
+      usableDevices: [],
+      separatedDevices: local,
+      continuingSpaceDevices: continuing,
+      verification,
+      hasOfflineDevices: continuing.some((device) => device.reachability !== 'online'),
+      decisionOutcome,
+    };
+  }
+
+  const currentViews = buildCurrentSpaceDeviceViews(query, rosterDevices);
+  const currentIds = new Set(currentViews.map((device) => device.deviceId));
+  const usableDevices = currentViews.filter((device) => device.canSync).map(operationDevice);
+  const localDeviceInSpace = context.localDeviceId
+    ? currentIds.has(context.localDeviceId)
+    : currentViews.some((device) => device.isLocal);
+  const localDeviceLeft = context.localDeviceId !== null && !localDeviceInSpace;
+  const separatedDevices = localDeviceLeft
+    ? context.beforeDevices.filter((device) => device.deviceId === context.localDeviceId)
+    : context.beforeDevices.filter(
+        (device) =>
+          !currentIds.has(device.deviceId) ||
+          (context.kind === 'removeMember' && device.deviceId === context.targetDeviceId)
+      );
+  const continuingSpaceDevices = localDeviceLeft
+    ? context.beforeDevices.filter((device) => device.deviceId !== context.localDeviceId)
+    : [];
+  return {
+    kind: context.kind,
+    spaceId: context.spaceId,
+    targetDeviceId: context.targetDeviceId,
+    localDeviceInSpace,
+    usableDevices,
+    separatedDevices,
+    continuingSpaceDevices,
+    verification,
+    hasOfflineDevices: [...currentViews, ...continuingSpaceDevices].some(
+      (device) => !device.isLocal && device.reachability !== 'online'
+    ),
+    decisionOutcome,
+  };
+}

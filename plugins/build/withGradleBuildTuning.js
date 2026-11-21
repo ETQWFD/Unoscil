@@ -1,0 +1,42 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const config_plugins_1 = require("expo/config-plugins");
+/**
+ * Tunes the generated `android/gradle.properties` for faster builds.
+ *
+ * ## Why
+ *
+ * `assembleRelease` is dominated by native (C++/NDK) compilation, and that cost
+ * scales linearly with the number of ABIs. The React Native template default,
+ * `reactNativeArchitectures=armeabi-v7a,arm64-v8a,x86,x86_64`, compiles the full
+ * native stack (RN C++ + Hermes + the unified engine) four times. In CI
+ * that step alone took ~22 min.
+ *
+ * 发布构建仅包含 32 位 armeabi-v7a。模拟器构建仍可用
+ * this property with `-PreactNativeArchitectures=x86_64`.
+ *
+ * Keep this in sync with `withAbiSplits.ts`: the split/output ABIs must be a
+ * subset of what is compiled here, or a split APK ships with no native libs.
+ *
+ * Also enables the Gradle build cache so unchanged task outputs (Java/Kotlin/
+ * resources) are reused across CI runs via the `setup-gradle` action cache.
+ * Reserve enough JVM heap and metaspace to merge native debug metadata.
+ */
+const RELEASE_DEVICE_ABIS = 'armeabi-v7a';
+const withGradleBuildTuning = (config) => (0, config_plugins_1.withGradleProperties)(config, (config) => {
+    const props = config.modResults;
+    const setProperty = (key, value) => {
+        const existing = props.find((item) => item.type === 'property' && item.key === key);
+        if (existing && existing.type === 'property') {
+            existing.value = value;
+        }
+        else {
+            props.push({ type: 'property', key, value });
+        }
+    };
+    setProperty('reactNativeArchitectures', RELEASE_DEVICE_ABIS);
+    setProperty('org.gradle.caching', 'true');
+    setProperty('org.gradle.jvmargs', '-Xmx4096m -XX:MaxMetaspaceSize=1024m');
+    return config;
+});
+exports.default = withGradleBuildTuning;

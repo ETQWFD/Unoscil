@@ -1,0 +1,1832 @@
+package expo.modules.ucengine
+
+import kotlinx.coroutines.launch
+
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.net.Uri
+import android.os.Build
+import android.provider.OpenableColumns
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
+import android.security.keystore.KeyProperties
+import android.util.Base64
+import android.util.Log
+import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
+import expo.modules.kotlin.exception.CodedException
+import expo.modules.kotlin.modules.Module
+import expo.modules.kotlin.modules.ModuleDefinition
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.ProviderException
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import org.json.JSONObject
+import uniffi.uc_engine_uniffi.ConnectivityOpportunity
+import uniffi.uc_engine_uniffi.CustomRelay
+import uniffi.uc_engine_uniffi.CustomRelayMutationRejection
+import uniffi.uc_engine_uniffi.CustomRelayMutationResult
+import uniffi.uc_engine_uniffi.BindingClipboardRepresentation
+import uniffi.uc_engine_uniffi.BindingClipboardRestoreMode
+import uniffi.uc_engine_uniffi.BindingClipboardRestoreOutcome
+import uniffi.uc_engine_uniffi.BindingClipboardSnapshot
+import uniffi.uc_engine_uniffi.BindingAnalyticsContext
+import uniffi.uc_engine_uniffi.BindingAnalyticsDeviceType
+import uniffi.uc_engine_uniffi.BindingAnalyticsOs
+import uniffi.uc_engine_uniffi.BindingConfig
+import uniffi.uc_engine_uniffi.BindingEngineState
+import uniffi.uc_engine_uniffi.ConfigImportRejectionReason
+import uniffi.uc_engine_uniffi.BindingErrorCategory
+import uniffi.uc_engine_uniffi.BindingEvent
+import uniffi.uc_engine_uniffi.BindingException
+import uniffi.uc_engine_uniffi.BindingFailure
+import uniffi.uc_engine_uniffi.BindingFileMetadata
+import uniffi.uc_engine_uniffi.BindingHost
+import uniffi.uc_engine_uniffi.BindingLifecycleAction
+import uniffi.uc_engine_uniffi.BindingRePairingScope
+import uniffi.uc_engine_uniffi.EntryNotResendableReason
+import uniffi.uc_engine_uniffi.HostBindingException
+import uniffi.uc_engine_uniffi.InvitationAvailability
+import uniffi.uc_engine_uniffi.JoinSpaceAttentionReason
+import uniffi.uc_engine_uniffi.JoinSpaceAttentionRecovery
+import uniffi.uc_engine_uniffi.JoinSpaceRejectionReason
+import uniffi.uc_engine_uniffi.JoinSpaceStatus
+import uniffi.uc_engine_uniffi.JoinSpaceTerminationReason
+import uniffi.uc_engine_uniffi.MobileEngine
+import uniffi.uc_engine_uniffi.MobileStartupLifecycle
+import uniffi.uc_engine_uniffi.OutboundProgress
+import uniffi.uc_engine_uniffi.ResendTargetProgress
+import uniffi.uc_engine_uniffi.BindingResourceRelease
+import uniffi.uc_engine_uniffi.ReceiveProgress
+import uniffi.uc_engine_uniffi.ReceiveRetryOutcome
+import uniffi.uc_engine_uniffi.RelayEntrySource
+import uniffi.uc_engine_uniffi.RelayOverview
+import uniffi.uc_engine_uniffi.RelayRoutingMode
+import uniffi.uc_engine_uniffi.ResendEntryOutcome
+import uniffi.uc_engine_uniffi.SendReport
+import uniffi.uc_engine_uniffi.WorkspaceConvergence
+import uniffi.uc_engine_uniffi.WorkspaceConvergenceFailureCategory
+import uniffi.uc_engine_uniffi.WorkspaceConvergencePhase
+import uniffi.uc_engine_uniffi.BindingObservabilityConfig
+import uniffi.uc_engine_uniffi.BindingDeploymentEnvironment
+import uniffi.uc_engine_uniffi.installProcessObservability
+import uniffi.uc_engine_uniffi.flushProcessObservability
+import uniffi.uc_engine_uniffi.queryProcessObservabilityHealth
+import uniffi.uc_engine_uniffi.BindingObservabilitySetup
+import uniffi.uc_engine_uniffi.BindingObservabilitySignalResult
+import uniffi.uc_engine_uniffi.BindingHostDiagnosticAction
+import uniffi.uc_engine_uniffi.BindingHostDiagnosticEvent
+import uniffi.uc_engine_uniffi.BindingHostLifecycleState
+import uniffi.uc_engine_uniffi.startLocalDiagnosticCapture
+import uniffi.uc_engine_uniffi.stopLocalDiagnosticCapture
+import uniffi.uc_engine_uniffi.queryLocalDiagnosticStatus
+import uniffi.uc_engine_uniffi.prepareLocalDiagnosticExport
+import uniffi.uc_engine_uniffi.coreVersion
+import uniffi.uc_engine_uniffi.BindingNetworkProcessRole
+
+private fun isFileListRepresentation(
+  format: String,
+  mimeType: String?
+): Boolean {
+  val knownFormat = format.equals("files", ignoreCase = true) ||
+    format.equals("public.file-url", ignoreCase = true) ||
+    format.equals("NSFilenamesPboardType", ignoreCase = true)
+  val knownMime = mimeType.equals("text/uri-list", ignoreCase = true) ||
+    mimeType.equals("file/uri-list", ignoreCase = true)
+  return knownFormat || knownMime
+}
+
+private fun uriListFile(
+  context: Context,
+  format: String,
+  mimeType: String?,
+  bytes: ByteArray
+): File? {
+  if (!isFileListRepresentation(format, mimeType)) return null
+
+  val uri = bytes.toString(Charsets.UTF_8)
+    .lineSequence()
+    .map(String::trim)
+    .firstOrNull { it.isNotEmpty() && !it.startsWith('#') }
+    ?.let(Uri::parse)
+    ?.takeIf { it.scheme.equals("file", ignoreCase = true) }
+    ?: return null
+  val path = uri.path ?: return null
+  val source = File(path).canonicalFile
+  val allowedRoots = listOf(context.filesDir.canonicalFile, context.cacheDir.canonicalFile)
+  if (allowedRoots.none { source.toPath().startsWith(it.toPath()) }) return null
+  return source.takeIf { it.isFile }
+}
+
+private fun isPlainTextRepresentation(format: String): Boolean {
+  val normalizedFormat = format.substringBefore(';').trim()
+  return normalizedFormat.equals("text/plain", ignoreCase = true) ||
+    normalizedFormat.equals("public.utf8-plain-text", ignoreCase = true) ||
+    normalizedFormat.equals("text", ignoreCase = true)
+}
+
+private fun analyticsContext(): BindingAnalyticsContext = BindingAnalyticsContext(
+  BindingAnalyticsOs.ANDROID,
+  Build.VERSION.RELEASE,
+  BindingAnalyticsDeviceType.MOBILE,
+  Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown",
+  if (BuildConfig.DEBUG) "development" else "production"
+)
+
+private fun customRelayMap(relay: CustomRelay): Map<String, Any> = mapOf(
+  "url" to relay.url,
+  "credentialConfigured" to relay.credentialConfigured
+)
+
+private fun relayRoutingModeName(mode: RelayRoutingMode): String = when (mode) {
+  RelayRoutingMode.BUILT_IN -> "builtIn"
+  RelayRoutingMode.CUSTOM -> "custom"
+  RelayRoutingMode.DISABLED -> "disabled"
+}
+
+private fun relayOverviewMap(overview: RelayOverview): Map<String, Any?> = mapOf(
+  "savedMode" to relayRoutingModeName(overview.savedMode),
+  "appliedMode" to overview.appliedMode?.let(::relayRoutingModeName),
+  "changePending" to overview.changePending,
+  "entries" to overview.entries.map { entry ->
+    mapOf(
+      "source" to when (entry.source) {
+        RelayEntrySource.BUILT_IN -> "builtIn"
+        RelayEntrySource.CUSTOM -> "custom"
+      },
+      "regionId" to entry.regionId,
+      "url" to entry.url,
+      "credentialConfigured" to entry.credentialConfigured,
+      "inEffect" to entry.inEffect
+    )
+  }
+)
+
+private fun customRelayMutationMap(result: CustomRelayMutationResult): Map<String, Any?> = mapOf(
+  "relays" to result.relays.map(::customRelayMap),
+  "rejection" to when (result.rejection) {
+    CustomRelayMutationRejection.INVALID_URL -> "invalidUrl"
+    CustomRelayMutationRejection.DUPLICATE -> "duplicate"
+    CustomRelayMutationRejection.NOT_FOUND -> "notFound"
+    null -> null
+  }
+)
+
+private fun workspaceConvergenceMap(convergence: WorkspaceConvergence): Map<String, Any?> = mapOf(
+  "phase" to when (convergence.phase) {
+    WorkspaceConvergencePhase.LOCALLY_APPLIED -> "locallyApplied"
+    WorkspaceConvergencePhase.CONVERGING -> "converging"
+    WorkspaceConvergencePhase.COMPLETE -> "complete"
+    WorkspaceConvergencePhase.RECOVERY_REQUIRED -> "recoveryRequired"
+  },
+  "revision" to convergence.revision.toLong(),
+  "historyEventCount" to convergence.historyEventCount.toLong(),
+  "effectiveMemberCount" to convergence.effectiveMemberCount.toLong(),
+  "pendingRemovalDecisionDeviceIds" to convergence.pendingRemovalDecisionDeviceIds,
+  "pendingRemovalDecisionEventId" to convergence.pendingRemovalDecisionEventId,
+  "divergedPeerDeviceIds" to convergence.divergedPeerDeviceIds,
+  "upgradeRequiredPeerDeviceIds" to convergence.upgradeRequiredPeerDeviceIds,
+  "convergenceDigest" to convergence.convergenceDigest,
+  "removed" to convergence.removed,
+  "updatedAtMs" to convergence.updatedAtMs,
+  "failureCategory" to when (convergence.failureCategory) {
+    WorkspaceConvergenceFailureCategory.SPACE_MISMATCH -> "spaceMismatch"
+    WorkspaceConvergenceFailureCategory.CONTINUITY_GAP -> "continuityGap"
+    WorkspaceConvergenceFailureCategory.IDENTITY_MISMATCH -> "identityMismatch"
+    WorkspaceConvergenceFailureCategory.DIGEST_CONFLICT -> "digestConflict"
+    WorkspaceConvergenceFailureCategory.UNAUTHORIZED -> "unauthorized"
+    WorkspaceConvergenceFailureCategory.VERSION_INCOMPATIBLE -> "versionIncompatible"
+    WorkspaceConvergenceFailureCategory.NO_EFFECTIVE_MEMBERS -> "noEffectiveMembers"
+    WorkspaceConvergenceFailureCategory.STORAGE -> "storage"
+    null -> null
+  }
+)
+
+private const val CLIPBOARD_SHARE_MAX_ENTRIES = 64
+private const val CLIPBOARD_SHARE_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1_000
+private const val FILE_DISPLAY_METADATA_FORMAT = "unoscil-file-display-metadata"
+private const val FILE_DISPLAY_METADATA_MIME =
+  "application/x-unoscil-file-display-metadata+json"
+
+private fun clipboardDisplayNames(
+  representations: List<BindingClipboardRepresentation>
+): Map<String, String> = representations.asSequence()
+  .filterIsInstance<BindingClipboardRepresentation.Inline>()
+  .firstOrNull {
+    it.format == FILE_DISPLAY_METADATA_FORMAT || it.mimeType == FILE_DISPLAY_METADATA_MIME
+  }
+  ?.let { representation ->
+    runCatching {
+      val files = JSONObject(representation.bytes.toString(Charsets.UTF_8)).getJSONArray("files")
+      buildMap {
+        for (index in 0 until files.length()) {
+          val file = files.getJSONObject(index)
+          val storageName = file.optString("storage_name")
+          val displayName = file.optString("display_name")
+          if (storageName.isNotBlank() && displayName.isNotBlank()) {
+            put(storageName, displayName)
+          }
+        }
+      }
+    }.getOrDefault(emptyMap())
+  }
+  .orEmpty()
+
+private fun safeClipboardDisplayName(value: String): String {
+  val leaf = value.substringAfterLast('/').substringAfterLast('\\').trim()
+  val sanitized = buildString {
+    leaf.codePoints().forEach { codePoint ->
+      val replacement = codePoint < 0x20 || codePoint == 0x7f
+      appendCodePoint(if (replacement) '_'.code else codePoint)
+    }
+  }
+  val candidate = buildString {
+    var byteCount = 0
+    sanitized.codePoints().forEach { codePoint ->
+      val character = String(Character.toChars(codePoint))
+      val characterBytes = character.toByteArray(Charsets.UTF_8).size
+      if (byteCount + characterBytes <= 240) {
+        append(character)
+        byteCount += characterBytes
+      }
+    }
+  }.trim()
+  return candidate.takeUnless { it.isBlank() || it == "." || it == ".." } ?: "file"
+}
+
+internal fun pruneClipboardShareCache(
+  root: File,
+  nowMs: Long = System.currentTimeMillis(),
+  maxEntries: Int = CLIPBOARD_SHARE_MAX_ENTRIES
+) {
+  val entries = root.listFiles()?.sortedByDescending(File::lastModified).orEmpty()
+  entries.forEachIndexed { index, entry ->
+    val expired = nowMs - entry.lastModified() > CLIPBOARD_SHARE_MAX_AGE_MS
+    if (expired || index >= maxEntries) entry.deleteRecursively()
+  }
+}
+
+private fun createClipboardShareFile(
+  context: Context,
+  displayName: String,
+  write: (File) -> Unit
+): File {
+  val root = File(context.cacheDir, "uc-engine-clipboard/shares")
+    .also { if (!it.exists() && !it.mkdirs()) throw HostBindingException.Io() }
+  pruneClipboardShareCache(root, maxEntries = CLIPBOARD_SHARE_MAX_ENTRIES - 1)
+  val directory = File(root, UUID.randomUUID().toString())
+    .also { if (!it.mkdirs()) throw HostBindingException.Io() }
+  val target = File(directory, safeClipboardDisplayName(displayName))
+  try {
+    write(target)
+    return target
+  } catch (error: Exception) {
+    directory.deleteRecursively()
+    throw error
+  }
+}
+
+private fun clipboardUri(context: Context, file: File): Uri = FileProvider.getUriForFile(
+  context,
+  "${context.packageName}.ucengine.files",
+  file
+)
+
+internal fun clipDataForRepresentation(
+  context: Context,
+  files: FileHandleRegistry,
+  representation: BindingClipboardRepresentation,
+  displayNames: Map<String, String> = emptyMap()
+): ClipData = when (representation) {
+  is BindingClipboardRepresentation.Inline -> {
+    val referencedFile = uriListFile(
+      context,
+      representation.format,
+      representation.mimeType,
+      representation.bytes
+    )
+    if (referencedFile != null) {
+      val displayName = displayNames[referencedFile.name] ?: referencedFile.name
+      val target = createClipboardShareFile(context, displayName) {
+        referencedFile.copyTo(it)
+      }
+      val uri = clipboardUri(context, target)
+      ClipData.newUri(context.contentResolver, displayName, uri)
+    } else if (isPlainTextRepresentation(representation.format)) {
+      ClipData.newPlainText("", representation.bytes.toString(Charsets.UTF_8))
+    } else {
+      val extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(representation.mimeType)
+        ?: "bin"
+      val file = createClipboardShareFile(context, "clipboard.$extension") {
+        it.writeBytes(representation.bytes)
+      }
+      val uri = clipboardUri(context, file)
+      ClipData.newUri(context.contentResolver, "", uri)
+    }
+  }
+  is BindingClipboardRepresentation.File -> {
+    val file = createClipboardShareFile(context, representation.displayName) { target ->
+      context.contentResolver.openInputStream(files.uri(representation.handle))?.use { input ->
+        target.outputStream().use(input::copyTo)
+      } ?: throw HostBindingException.Io()
+    }
+    ClipData.newUri(context.contentResolver, representation.displayName, clipboardUri(context, file))
+  }
+}
+
+internal fun clipDataForSnapshot(
+  context: Context,
+  files: FileHandleRegistry,
+  representations: List<BindingClipboardRepresentation>
+): ClipData {
+  val displayNames = clipboardDisplayNames(representations)
+  val candidates = representations.filter {
+    it !is BindingClipboardRepresentation.Inline ||
+      (it.format != FILE_DISPLAY_METADATA_FORMAT && it.mimeType != FILE_DISPLAY_METADATA_MIME)
+  }
+  // Prefer a usable materialized file regardless of representation order.
+  val file = candidates.firstOrNull {
+    it is BindingClipboardRepresentation.File ||
+      (it is BindingClipboardRepresentation.Inline &&
+        uriListFile(context, it.format, it.mimeType, it.bytes) != null)
+  }
+  if (file != null) return clipDataForRepresentation(context, files, file, displayNames)
+  // Preserve the existing non-file fallback order; never share URI-list bytes as a file.
+  val first = candidates.firstOrNull {
+    it is BindingClipboardRepresentation.Inline &&
+      !isFileListRepresentation(it.format, it.mimeType)
+  } ?: if (candidates.isEmpty()) return ClipData.newPlainText("", "")
+    else throw HostBindingException.Unavailable()
+  return clipDataForRepresentation(context, files, first, displayNames)
+}
+
+/**
+ * Process-wide owner of the single Rust Engine.
+ *
+ * The Engine used to live inside the JS module instance, so destroying the React runtime (task
+ * removal, activity teardown, bridge reload) shut it down even while the background service was
+ * meant to keep syncing. The owner outlives any JS runtime: the module attaches to it, the service
+ * retains it, and the Engine only shuts down once neither holds it (or when asked explicitly).
+ * All state transitions are serialized by [lock].
+ */
+object EngineOwner {
+  /**
+   * Every state transition (start, shutdown, retain/release, lifecycle policy) runs under this
+   * lock, so a service release can never interleave with a JS start or a shutdown. [lock] only
+   * guards the fields for readers that are not transitions.
+   */
+  private val transitions = java.util.concurrent.locks.ReentrantLock()
+  private val lock = Any()
+  private val lifecycle = NativeLifecycleHost { error ->
+    Log.e("UcEngine", "P2P engine lifecycle transition failed", error)
+  }
+  private var logInstallation: BindingObservabilitySetup? = null
+  private var engine: MobileEngine? = null
+  private var startupLifecycle: MobileStartupLifecycle? = null
+  private var startupFailure: Throwable? = null
+  private var files: FileHandleRegistry? = null
+  private var analytics: AndroidPostHogAnalyticsHost? = null
+  private var retainers = 0
+  private var finalRelease: BindingResourceRelease? = null
+  private var pendingSuspension: MobileEngine? = null
+  private var suspensionWaitScheduled = false
+  private var suspensionBackoffMs = 100L
+  private var resumeAfterSuspension = true
+  private var backgroundSyncRequested = false
+
+  internal fun engine(): MobileEngine? = synchronized(lock) { engine }
+  internal fun files(): FileHandleRegistry? = synchronized(lock) { files }
+  internal fun logInstallation(): BindingObservabilitySetup? = synchronized(lock) { logInstallation }
+  internal fun setLogInstallation(setup: BindingObservabilitySetup) = synchronized(lock) { logInstallation = setup }
+
+  /** True while an Engine (or one that is starting) exists in this process. */
+  fun isActive(): Boolean = synchronized(lock) { engine != null || startupLifecycle != null }
+
+  /** Number of native holders (background service) keeping the Engine alive. */
+  fun retainerCount(): Int = synchronized(lock) { retainers }
+
+  private fun reportLifecycleError(error: Throwable) {
+    Log.e("UcEngine", "P2P engine lifecycle transition failed", error)
+  }
+
+  private fun currentLifecycle(context: Context): EngineLifecycle? = synchronized(lock) {
+    engine?.let { AndroidEngineLifecycle(it, AndroidNativeDiagnostics.get(context)) }
+      ?: startupLifecycle?.let(::AndroidStartupLifecycle)
+  }
+
+  internal fun analyticsHost(context: Context, appVersion: String? = null): AndroidPostHogAnalyticsHost =
+    synchronized(lock) {
+      analytics?.also { host -> appVersion?.let { host.updateApplicationContext(it, 0) } }
+        ?: AndroidPostHogAnalyticsHost(context, appVersion ?: applicationVersion(context))
+          .also { analytics = it }
+    }
+
+  internal fun refreshAnalyticsContext(engine: MobileEngine, appVersion: String? = null) {
+    val count = runCatching { engine.listDevices().size }.getOrDefault(0)
+    val host = synchronized(lock) { analytics }
+    host?.updateApplicationContext(appVersion ?: "unknown", count)
+    val spaceId = runCatching { engine.querySpaceState().spaceId }.getOrNull()
+    host?.ensureSpaceContext(spaceId, count)
+  }
+
+  private fun applicationVersion(context: Context): String = runCatching {
+    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
+  }.getOrDefault("unknown")
+
+  /**
+   * Starts the Engine, or attaches to one that is already running. A second start from a runtime
+   * that is already attached is still a caller error.
+   */
+  internal fun start(
+    context: Context,
+    config: Map<String, String>,
+    allowAttach: Boolean,
+    networkRole: BindingNetworkProcessRole = BindingNetworkProcessRole.MOBILE_APP
+  ) = transitions.withLockHeld { startLocked(context, config, allowAttach, networkRole) }
+
+  private fun startLocked(
+    context: Context,
+    config: Map<String, String>,
+    allowAttach: Boolean,
+    networkRole: BindingNetworkProcessRole
+  ) {
+    val diagnostics = AndroidNativeDiagnostics.get(context)
+    AndroidNativeDiagnostics.observe(diagnostics, NativeDiagnosticEvent.ENGINE_START, NativeDiagnosticTrigger.APP_STARTUP) {
+      synchronized(lock) {
+        if (engine != null || startupLifecycle != null) {
+          check(finalRelease == null && startupFailure == null) { "Engine cleanup retains ownership; wait or explicitly retry cleanup before attaching" }
+          if (allowAttach) return@observe
+          throw UcEngineAlreadyStartedException()
+        }
+      }
+      finalRelease = null
+      startupFailure = null
+      check(UcEngineModule.installAndroidContext(context)) { "Failed to initialize the Android P2P runtime" }
+      val registry = FileHandleRegistry(context)
+      val appVersion = config["appVersion"] ?: applicationVersion(context)
+      val analytics = analyticsHost(context, appVersion)
+      val host = AndroidEngineHost(context, registry)
+      // Configured before the process subscriber exists; a failure only shows in the network status.
+      NetworkLogHost.configureBeforeInstall(networkRole)
+      val logSetup = installProcessObservability(
+        BindingObservabilityConfig(
+          serviceVersion = engineServiceVersion(appVersion),
+          environment = if (BuildConfig.DEBUG) BindingDeploymentEnvironment.DEVELOPMENT else BindingDeploymentEnvironment.PRODUCTION,
+          appChannel = analyticsContext().appChannel,
+          remoteDiagnosticsEnabled = false,
+          collector = null
+        ),
+        host
+      )
+      synchronized(lock) { logInstallation = logSetup }
+      EngineDiagnosticBridge.register()
+      AndroidNativeDiagnostics.replayNetworkToEngine()
+      val startup = MobileStartupLifecycle()
+      synchronized(lock) {
+        if (engine != null || startupLifecycle != null) {
+          check(finalRelease == null && startupFailure == null) { "Engine cleanup retains ownership; wait or explicitly retry cleanup before attaching" }
+          if (allowAttach) return@observe
+          throw UcEngineAlreadyStartedException()
+        }
+        startupLifecycle = startup
+      }
+      val started = try {
+        EngineDiagnosticBridge.observe(BindingHostDiagnosticAction.RUNTIME_START) {
+          MobileEngine.startWithAnalyticsAndLifecycle(
+            BindingConfig(appVersion, config["profileId"] ?: "default"),
+            host,
+            analytics,
+            analyticsContext(),
+            startup
+          )
+        }
+      } catch (error: Throwable) {
+        // No returned Engine means no complete cleanup receipt at this SDK baseline.
+        // Retain the startup owner and host registry until the upstream contract resolves it.
+        synchronized(lock) { startupFailure = error; files = registry }
+        throw error
+      }
+      try {
+        lifecycle.prepare(AndroidEngineLifecycle(started, diagnostics))
+        refreshAnalyticsContext(started, appVersion)
+      } catch (error: Throwable) {
+        synchronized(lock) {
+          engine = started
+          files = registry
+          if (startupLifecycle === startup) startupLifecycle = null
+        }
+        // A returned Engine remains owned until a complete final receipt, even after prepare fails.
+        runCatching {
+          if (!shutdownLocked(context, 2_000)) {
+            releaseExecutor.execute { runCatching { shutdownUntilComplete(context.applicationContext) }.onFailure(::reportLifecycleError) }
+          }
+        }.onFailure(::reportLifecycleError)
+        throw error
+      }
+      synchronized(lock) {
+        if (engine != null) {
+          started.close()
+          throw UcEngineAlreadyStartedException()
+        }
+        files = registry
+        engine = started
+        if (startupLifecycle === startup) startupLifecycle = null
+      }
+    }
+  }
+
+  /**
+   * Native-initiated start for recovery while no JS runtime exists (sticky restart, boot).
+   * Returns true when an Engine is running afterwards.
+   */
+  fun startNative(context: Context): Boolean {
+    val appContext = context.applicationContext
+    return try {
+      // No JS runtime exists here, so a process installed by this path is the background service.
+      start(
+        appContext,
+        mapOf("appVersion" to applicationVersion(appContext), "profileId" to "default"),
+        allowAttach = true,
+        networkRole = BindingNetworkProcessRole.BACKGROUND_SERVICE
+      )
+      engine() != null
+    } catch (error: Throwable) {
+      reportLifecycleError(error)
+      false
+    }
+  }
+
+  private val hintExecutor by lazy { java.util.concurrent.Executors.newSingleThreadExecutor { Thread(it, "uc-network-hint") } }
+
+  /**
+   * Tells a running Engine the default network changed, from the native connectivity callback.
+   * The JS runtime reports the same hint while it is alive; a hint only prompts the Engine to retry
+   * its connections, so a duplicate costs one extra attempt.
+   */
+  internal fun hintNetworkChanged() {
+    val active = engine() ?: return
+    hintExecutor.execute {
+      runCatching { active.notifyConnectivityOpportunity(ConnectivityOpportunity.NETWORK_CHANGED) }
+        .onSuccess { Log.i("UcEngine", "native_network_hint outcome=delivered") }
+        .onFailure { Log.w("UcEngine", "native_network_hint outcome=failed errorKind=${it.javaClass.simpleName}") }
+    }
+  }
+
+  /** The background service holds the Engine alive across JS runtime destruction. */
+  /** Only ever prevents a shutdown, so it needs no transition lock and never blocks the caller's thread. */
+  fun retain() {
+    synchronized(lock) { retainers += 1 }
+    Log.i("UcEngine", "engine_owner retain retainers=${retainerCount()}")
+  }
+
+  private val releaseExecutor by lazy { java.util.concurrent.Executors.newSingleThreadScheduledExecutor { Thread(it, "uc-engine-release") } }
+
+  /**
+   * Releases a hold off the caller's thread (the service's main thread must not wait for a start or
+   * a shutdown); the Engine is shut down when nothing else needs it and no JS runtime is attached.
+   */
+  fun release(context: Context) {
+    val appContext = context.applicationContext
+    releaseExecutor.execute { releaseNow(appContext) }
+  }
+
+  private fun releaseNow(context: Context) = transitions.withLockHeld {
+    val stop = synchronized(lock) {
+      retainers = (retainers - 1).coerceAtLeast(0)
+      retainers == 0 && attachedRuntimes == 0
+    }
+    Log.i("UcEngine", "engine_owner release retainers=${retainerCount()} shutdown=$stop")
+    if (stop) runCatching { shutdownUntilComplete(context.applicationContext) }.onFailure(::reportLifecycleError)
+  }
+
+  private var attachedRuntimes = 0
+
+  internal fun runtimeAttached() = transitions.withLockHeld {
+    synchronized(lock) { attachedRuntimes += 1 }
+    Log.i("UcEngine", "engine_owner runtime_attached runtimes=$attachedRuntimes")
+  }
+
+  /** A JS runtime was destroyed; the Engine survives when the background service still holds it. */
+  internal fun runtimeDetached(context: Context?) {
+    val application = context?.applicationContext
+    releaseExecutor.execute { runtimeDetachedNow(application) }
+  }
+
+  private fun runtimeDetachedNow(context: Context?) = transitions.withLockHeld {
+    val stop = synchronized(lock) {
+      attachedRuntimes = (attachedRuntimes - 1).coerceAtLeast(0)
+      retainers == 0 && attachedRuntimes == 0
+    }
+    Log.i("UcEngine", "engine_owner runtime_detached retainers=${retainerCount()} shutdown=${stop && context != null}")
+    if (stop && context != null) runCatching { shutdownUntilComplete(context) }.onFailure(::reportLifecycleError)
+  }
+
+  internal fun setBackgroundSyncEnabled(context: Context, enabled: Boolean, appIsBackground: Boolean) =
+    transitions.withLockHeld {
+      val diagnostics = AndroidNativeDiagnostics.get(context)
+      backgroundSyncRequested = enabled
+      resumeAfterSuspension = !appIsBackground || enabled
+      lifecycle.setBackgroundSyncEnabled(
+        engine()?.let { AndroidEngineLifecycle(it, diagnostics) },
+        enabled,
+        appIsBackground
+      )
+    }
+
+  internal fun enterBackground(context: Context) {
+    val application = context.applicationContext
+    releaseExecutor.execute { transitions.withLockHeld {
+      resumeAfterSuspension = backgroundSyncRequested
+      lifecycle.enterBackground(currentLifecycle(application))
+    } }
+  }
+
+  internal fun enterForeground(context: Context) {
+    val application = context.applicationContext
+    releaseExecutor.execute { transitions.withLockHeld {
+      resumeAfterSuspension = true
+      if (pendingSuspension == null) lifecycle.enterForeground(currentLifecycle(application))
+    } }
+  }
+
+  /** Pending repeats the same accepted cleanup off the main thread. Failed never loops. */
+  internal fun suspendOwned(active: MobileEngine, deadlineMs: ULong) {
+    check(engine() === active && finalRelease == null) { "Engine final cleanup owns this instance" }
+    when (val outcome = active.suspendWithOutcome(deadlineMs)) {
+      BindingResourceRelease.Pending -> {
+        pendingSuspension = active
+        if (!suspensionWaitScheduled) {
+          suspensionWaitScheduled = true
+          val backoff = suspensionBackoffMs
+          suspensionBackoffMs = (suspensionBackoffMs * 2).coerceAtMost(1_000)
+          releaseExecutor.schedule({ transitions.withLockHeld {
+            suspensionWaitScheduled = false
+            val pending = pendingSuspension
+            if (pending != null && engine() === pending && finalRelease == null) {
+              runCatching { suspendOwned(pending, deadlineMs) }.onFailure(::reportLifecycleError)
+            }
+          } }, backoff, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+      }
+      is BindingResourceRelease.Failed -> {
+        pendingSuspension = null
+        suspensionBackoffMs = 100
+        throw outcome.error
+      }
+      is BindingResourceRelease.Released -> {
+        pendingSuspension = null
+        suspensionBackoffMs = 100
+        if (resumeAfterSuspension) {
+          try { active.resume() } catch (resumeError: Throwable) {
+            outcome.error?.let { it.addSuppressed(resumeError); throw it }
+            throw resumeError
+          }
+        }
+        outcome.error?.let { throw it }
+      }
+    }
+  }
+
+  internal fun suspendExplicit() = transitions.withLockHeld {
+    resumeAfterSuspension = false
+    suspendOwned(checkNotNull(engine()) { "Engine is not started" }, 2_000uL)
+  }
+
+  internal fun resumeExplicit() = transitions.withLockHeld {
+    resumeAfterSuspension = true
+    if (pendingSuspension == null) checkNotNull(engine()) { "Engine is not started" }.resume()
+  }
+
+  internal fun shutdown(context: Context, deadlineMs: Long) = transitions.withLockHeld {
+    check(shutdownLocked(context, deadlineMs)) { "Engine cleanup is pending; ownership is retained" }
+  }
+
+  private inline fun <T> java.util.concurrent.locks.ReentrantLock.withLockHeld(block: () -> T): T {
+    lock()
+    try { return block() } finally { unlock() }
+  }
+
+  /** Only a complete receipt permits destruction. A lifecycle state is never a receipt. */
+  private fun shutdownLocked(context: Context, deadlineMs: Long): Boolean {
+    val diagnostics = AndroidNativeDiagnostics.get(context)
+    val active = engine()
+    if (active == null) {
+      // A no-object failed startup has no release certificate. Keep its owner.
+      check(synchronized(lock) { startupLifecycle == null }) { "Startup cleanup has no complete release receipt" }
+      (finalRelease as? BindingResourceRelease.Released)?.error?.let { throw it }
+      return true
+    }
+    try {
+      val outcome = active.shutdownWithOutcome(deadlineMs.toULong())
+      finalRelease = outcome
+      when (outcome) {
+        BindingResourceRelease.Pending -> return false
+        is BindingResourceRelease.Failed -> throw outcome.error
+        is BindingResourceRelease.Released -> {
+          val registry = synchronized(lock) {
+            if (engine === active) {
+              engine = null
+              files.also { files = null }
+            } else null
+          }
+          pendingSuspension = null
+          active.close()
+          registry?.removeAll()
+          outcome.error?.let { throw it }
+          return true
+        }
+      }
+    } finally { diagnostics.flush() }
+  }
+
+  internal fun shutdownUntilComplete(context: Context) = transitions.withLockHeld {
+    var backoffMs = 50L
+    while (!shutdownLocked(context, 5_000)) {
+      // Wait again on the same accepted cleanup. Failed exits through its own error.
+      Thread.sleep(backoffMs)
+      backoffMs = (backoffMs * 2).coerceAtMost(1_000)
+    }
+  }
+
+}
+
+class UcEngineModule : Module() {
+  companion object {
+    init {
+      System.loadLibrary("uc_engine_uniffi")
+    }
+
+    @JvmStatic
+    private external fun nativeInstallAndroidContext(context: Context): Boolean
+
+    // The JNI symbol is bound to this class, so the owner reaches it through this wrapper.
+    fun installAndroidContext(context: Context): Boolean = nativeInstallAndroidContext(context)
+  }
+
+  private val diagnostics by lazy { AndroidNativeDiagnostics.get(requireContext()) }
+
+  // This module is a view onto the process-wide EngineOwner. It reports whether this JS runtime has
+  // already attached, so a second start call from the same runtime is still an error.
+  private var attached = false
+
+  // The react context can already be gone when the module is destroyed; the last runtime to detach
+  // still needs a context to shut the Engine down when no service holds it.
+  private var attachedContext: Context? = null
+
+  // Process diagnostics are available before the first synchronization session.
+  private fun prepareDiagnosticLogging() {
+    if (runCatching { queryLocalDiagnosticStatus() }.isSuccess) return
+    val context = requireContext()
+    val version = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
+    NetworkLogHost.configureBeforeInstall(BindingNetworkProcessRole.MOBILE_APP)
+    val setup = installProcessObservability(
+      BindingObservabilityConfig(engineServiceVersion(version),
+        if (BuildConfig.DEBUG) BindingDeploymentEnvironment.DEVELOPMENT else BindingDeploymentEnvironment.PRODUCTION,
+        analyticsContext().appChannel, false, null),
+      AndroidEngineHost(context, FileHandleRegistry(context))
+    )
+    EngineOwner.setLogInstallation(setup)
+    EngineDiagnosticBridge.register()
+    AndroidNativeDiagnostics.replayNetworkToEngine()
+  }
+
+  override fun definition() = ModuleDefinition {
+    Name("UcEngine")
+    OnCreate {
+      AndroidNativeDiagnostics.get(requireContext())
+      appContext.backgroundCoroutineScope.launch { runCatching { prepareDiagnosticLogging() } }
+    }
+
+    Function("coreVersion") { coreVersion() }
+
+    AsyncFunction("queryRejectedConfigImport") {
+      engineResult {
+        mapOf("rejection" to requireEngine().queryRejectedConfigImport()?.let { rejected ->
+          val reason = when (rejected.reason) {
+            ConfigImportRejectionReason.UNSUPPORTED_FORMAT -> "unsupportedFormat"
+            ConfigImportRejectionReason.MALFORMED_MARKER -> "malformedMarker"
+            ConfigImportRejectionReason.MISSING_RUNTIME_MEMBERS -> "missingRuntimeMembers"
+          }
+          mapOf("reason" to reason, "message" to rejected.message)
+        })
+      }
+    }
+
+    AsyncFunction("startEngineDiagnosticCapture") { durationMs: Double ->
+      prepareDiagnosticLogging()
+      require(durationMs.isFinite() && durationMs >= 1_000 && durationMs <= 900_000)
+      EngineDiagnosticBridge.map(startLocalDiagnosticCapture(durationMs.toULong()))
+    }
+    AsyncFunction("stopEngineDiagnosticCapture") { captureId: String ->
+      EngineDiagnosticBridge.map(stopLocalDiagnosticCapture(captureId))
+    }
+    AsyncFunction("getEngineDiagnosticStatus") { prepareDiagnosticLogging(); EngineDiagnosticBridge.map(queryLocalDiagnosticStatus()) }
+    AsyncFunction("prepareEngineDiagnosticExport") { prepareDiagnosticLogging(); EngineDiagnosticBridge.map(prepareLocalDiagnosticExport(1_000uL)) }
+
+    // The network-library log is a separate source with its own state; none of these calls depend
+    // on, or change, the business log. Expo runs AsyncFunction bodies off the main thread.
+    AsyncFunction("getNetworkLogStatus") {
+      runCatching { prepareDiagnosticLogging() }
+      NetworkLogHost.status()
+    }
+    AsyncFunction("startNetworkLogCapture") { durationMs: Double ->
+      runCatching { prepareDiagnosticLogging() }
+      if (!durationMs.isFinite() || durationMs < 0 || durationMs > Long.MAX_VALUE.toDouble()) {
+        mapOf("ok" to false, "error" to "invalidDuration")
+      } else {
+        NetworkLogHost.startCapture(durationMs.toLong())
+      }
+    }
+    AsyncFunction("stopNetworkLogCapture") { captureId: String -> NetworkLogHost.stopCapture(captureId) }
+    AsyncFunction("prepareNetworkLogExport") {
+      runCatching { prepareDiagnosticLogging() }
+      NetworkLogHost.prepareExport(requireContext(), 1_000)
+    }
+    AsyncFunction("releaseNetworkLogExport") { exportId: String ->
+      NetworkLogHost.releaseExport(requireContext(), exportId)
+    }
+
+    AsyncFunction("flushEngineLogs") {
+      val summary = flushProcessObservability(1_000uL)
+      summary.logs == BindingObservabilitySignalResult.COMPLETED
+    }
+
+    AsyncFunction("getNativeDiagnostics") { diagnostics.exportSnapshot() }
+    AsyncFunction("getPowerMetrics") { AndroidPowerMetrics.get(requireContext()).snapshot() }
+    AsyncFunction("resetPowerMetrics") { AndroidPowerMetrics.get(requireContext()).reset() }
+
+    AsyncFunction("getEngineLogStatus") {
+      val health = runCatching { queryProcessObservabilityHealth() }.getOrNull()
+      val setup = EngineOwner.logInstallation()
+      mapOf(
+        "localFile" to (health?.localFile?.name?.lowercase(java.util.Locale.ROOT) ?: "unavailable"),
+        "droppedLocalRecords" to health?.droppedLocalRecords?.toDouble(),
+        "installation" to setup?.let {
+          mapOf(
+            "localFile" to it.localFile.name.lowercase(java.util.Locale.ROOT),
+            "droppedLocalRecords" to it.droppedLocalRecords.toDouble()
+          )
+        }
+      )
+    }
+
+    AsyncFunction("start") { config: Map<String, String> ->
+      val context = requireContext()
+      // An engine already running (kept by the background service while this runtime was gone) is
+      // attached to, not started a second time: there is one Engine per profile.
+      // Attach first: the service may release its hold at any moment, and an Engine that is
+      // started while no runtime is counted would be shut down by that release.
+      val firstAttach = !attached
+      if (firstAttach) {
+        EngineOwner.runtimeAttached()
+        attached = true
+        attachedContext = context.applicationContext
+      }
+      try {
+        EngineOwner.start(context, config, allowAttach = firstAttach)
+      } catch (error: Throwable) {
+        if (firstAttach) { attached = false; attachedContext = null; EngineOwner.runtimeDetached(context) }
+        throw error
+      }
+    }
+
+    AsyncFunction("shutdown") { deadlineMs: Long -> EngineOwner.shutdown(requireContext(), deadlineMs) }
+    AsyncFunction("shutdownUntilComplete") { EngineOwner.shutdownUntilComplete(requireContext()) }
+    AsyncFunction("suspend") { EngineOwner.suspendExplicit() }
+    AsyncFunction("resume") { EngineOwner.resumeExplicit() }
+    AsyncFunction("setBackgroundSyncEnabled") { enabled: Boolean, appIsBackground: Boolean ->
+      EngineOwner.setBackgroundSyncEnabled(requireContext(), enabled, appIsBackground)
+    }
+    AsyncFunction("getAnalyticsConsent") {
+      analyticsHost(requireContext()).consentEnabled()
+    }
+    AsyncFunction("getAnalyticsState") {
+      analyticsHost(requireContext()).getAnalyticsState()
+    }
+    AsyncFunction("setAnalyticsConsent") { enabled: Boolean ->
+      analyticsHost(requireContext()).setConsentEnabled(enabled)
+    }
+    AsyncFunction("resetAnalyticsIdentity") {
+      analyticsHost(requireContext()).resetAndIdentify()
+    }
+
+    AsyncFunction("createSpace") { deviceName: String?, passphrase: String ->
+      engineResult {
+        val engine = requireEngine()
+        val result = engine.createSpace(deviceName, passphrase)
+        refreshAnalyticsContext(engine)
+        mapOf(
+          "spaceId" to result.spaceId,
+          "selfDeviceId" to result.selfDeviceId,
+          "identityFingerprint" to result.identityFingerprint
+        )
+      }
+    }
+    AsyncFunction("issueInvitation") {
+      engineResult {
+        val result = requireEngine().issueInvitation()
+        val availability = when (result.availability) {
+          InvitationAvailability.CROSS_NETWORK -> "crossNetwork"
+          InvitationAvailability.SAME_LOCAL_NETWORK -> "sameLocalNetwork"
+        }
+        mapOf(
+          "invitationCode" to result.invitationCode,
+          "fullInvitation" to result.fullInvitation,
+          "expiresAtMs" to result.expiresAtMs,
+          "availability" to availability
+        )
+      }
+    }
+    AsyncFunction("joinSpace") { invitationCode: String, deviceName: String?, passphrase: String, preserveUnreadableHistory: Boolean ->
+      engineResult {
+        val engine = requireEngine()
+        val result = engine.joinSpace(
+          invitationCode,
+          deviceName,
+          passphrase,
+          preserveUnreadableHistory
+        )
+        refreshAnalyticsContext(engine)
+        when (result) {
+          is JoinSpaceStatus.Active -> mapOf(
+            "type" to "active",
+            "peerUpgradeRequired" to result.peerUpgradeRequired,
+            "joinId" to result.joinId,
+            "joinedSpace" to mapOf(
+              "sponsorDeviceId" to result.joinedSpace.sponsorDeviceId,
+              "sponsorIdentityFingerprint" to result.joinedSpace.sponsorIdentityFingerprint,
+              "spaceId" to result.joinedSpace.spaceId,
+              "selfDeviceId" to result.joinedSpace.selfDeviceId,
+              "selfIdentityFingerprint" to result.joinedSpace.selfIdentityFingerprint,
+              "migratedRecords" to (result.joinedSpace.migratedRecords?.toLong() ?: 0L),
+              "preservedUnreadableRecords" to (result.joinedSpace.preservedUnreadableRecords?.toLong() ?: 0L)
+            )
+          )
+          is JoinSpaceStatus.Pending -> mapOf(
+            "type" to "pending",
+            "peerUpgradeRequired" to result.peerUpgradeRequired,
+            "joinId" to result.joinId,
+            "targetSpaceId" to result.targetSpaceId,
+            "sponsorDeviceId" to result.sponsorDeviceId,
+            "sponsorIdentityFingerprint" to result.sponsorIdentityFingerprint,
+            "cancelRequested" to result.cancelRequested
+          )
+          is JoinSpaceStatus.Processing -> mapOf(
+            "type" to "processing",
+            "joinId" to result.joinId,
+            "targetSpaceId" to result.targetSpaceId,
+            "sponsorDeviceId" to result.sponsorDeviceId,
+            "sponsorIdentityFingerprint" to result.sponsorIdentityFingerprint,
+            "peerUpgradeRequired" to result.peerUpgradeRequired
+          )
+          is JoinSpaceStatus.NeedsAttention -> mapOf(
+            "type" to "needsAttention",
+            "joinId" to result.joinId,
+            "reason" to when (result.reason) {
+              JoinSpaceAttentionReason.OUTCOME_CANNOT_BE_PROVEN -> "outcomeCannotBeProven"
+              JoinSpaceAttentionReason.CONTINUATION_UNAVAILABLE -> "continuationUnavailable"
+            },
+            "recovery" to when (result.recovery) {
+              JoinSpaceAttentionRecovery.PRESERVE_DATA_AND_CONTACT_SUPPORT -> "preserveDataAndContactSupport"
+              JoinSpaceAttentionRecovery.RESTART_WITH_NEW_INVITATION -> "restartWithNewInvitation"
+            },
+            "nextRetryAtMs" to result.nextRetryAtMs
+          )
+          is JoinSpaceStatus.Rejected -> mapOf(
+            "type" to "rejected",
+            "joinId" to result.joinId,
+            "reason" to when (result.reason) {
+              JoinSpaceRejectionReason.INVITATION_UNAVAILABLE -> "invitationUnavailable"
+              JoinSpaceRejectionReason.AUTHENTICATION_REJECTED -> "authenticationRejected"
+              JoinSpaceRejectionReason.IDENTITY_CONFLICT -> "identityConflict"
+              JoinSpaceRejectionReason.BASE_HISTORY_CHANGED -> "baseHistoryChanged"
+              JoinSpaceRejectionReason.JOINER_HISTORY_AHEAD -> "joinerHistoryAhead"
+              JoinSpaceRejectionReason.HISTORY_CONFLICT -> "historyConflict"
+              JoinSpaceRejectionReason.COMPLETION_INVALID -> "completionInvalid"
+              JoinSpaceRejectionReason.MEMBERSHIP_HISTORY_INVALID -> "membershipHistoryInvalid"
+              JoinSpaceRejectionReason.SECURITY_MATERIAL_INVALID -> "securityMaterialInvalid"
+              JoinSpaceRejectionReason.RELATIONSHIP_CONFLICT -> "relationshipConflict"
+              JoinSpaceRejectionReason.ACTIVATION_STATE_INVALID -> "activationStateInvalid"
+              JoinSpaceRejectionReason.PEER_UPGRADE_REQUIRED -> "peerUpgradeRequired"
+              JoinSpaceRejectionReason.SPONSOR_UNRESPONSIVE -> "sponsorUnresponsive"
+              JoinSpaceRejectionReason.CANCELLED -> "cancelled"
+              JoinSpaceRejectionReason.REMOVED_BEFORE_ACTIVATION -> "removedBeforeActivation"
+            }
+          )
+          is JoinSpaceStatus.Terminated -> mapOf(
+            "type" to "terminated",
+            "joinId" to result.joinId,
+            "reason" to when (result.reason) {
+              JoinSpaceTerminationReason.CANCELLED -> "cancelled"
+              JoinSpaceTerminationReason.EXPIRED -> "expired"
+              JoinSpaceTerminationReason.SUPERSEDED -> "superseded"
+            }
+          )
+        }
+      }
+    }
+    AsyncFunction("cancelJoinSpace") { joinId: String ->
+      requireEngine().cancelJoinSpace(joinId)
+      Unit
+    }
+    AsyncFunction("nextEvent") { timeoutMs: Long ->
+      requireEngine().nextEvent(timeoutMs.toULong())?.let(::eventMap)?.also {
+        (it["type"] as? String)?.let { type -> AndroidPowerMetrics.current()?.countEngineEvent(type) }
+      }
+    }.runOnQueue(appContext.backgroundCoroutineScope)
+    AsyncFunction("notifyConnectivityOpportunity") { reason: String ->
+      val opportunity = when (reason) {
+        "foreground" -> ConnectivityOpportunity.FOREGROUND
+        "system_wake" -> ConnectivityOpportunity.SYSTEM_WAKE
+        "network_changed" -> ConnectivityOpportunity.NETWORK_CHANGED
+        else -> throw IllegalArgumentException("Invalid connectivity opportunity")
+      }
+      requireEngine().notifyConnectivityOpportunity(opportunity)
+    }
+    AsyncFunction("refreshPeerConnections") {
+      val result = requireEngine().refreshPeerConnections()
+      mapOf(
+        "total" to result.total.toLong(),
+        "online" to result.online.toLong(),
+        "offline" to result.offline.toLong(),
+        "errors" to result.errors.toLong()
+      )
+    }
+    AsyncFunction("saveCustomRelayNode") {
+      url: String, accessToken: String, previousUrl: String? ->
+      val result = requireEngine().saveCustomRelay(url, accessToken, previousUrl)
+      mapOf("configured" to result.configured)
+    }
+    AsyncFunction("queryRelayOverview") {
+      relayOverviewMap(requireEngine().queryRelayOverview())
+    }
+
+    AsyncFunction("queryCustomRelays") {
+      requireEngine().queryCustomRelays().map(::customRelayMap)
+    }
+    AsyncFunction("addCustomRelay") { url: String, accessToken: String ->
+      customRelayMutationMap(requireEngine().addCustomRelay(url, accessToken))
+    }
+    AsyncFunction("editCustomRelay") {
+      previousUrl: String, url: String, accessToken: String ->
+      customRelayMutationMap(requireEngine().editCustomRelay(previousUrl, url, accessToken))
+    }
+    AsyncFunction("deleteCustomRelay") { url: String ->
+      customRelayMutationMap(requireEngine().deleteCustomRelay(url))
+    }
+    AsyncFunction("querySpaceState") {
+      val result = runSpaceRead("querySpaceState") { requireEngine().querySpaceState() }
+      Log.i(
+        "UcEngine",
+        "space_read operation=querySpaceState outcome=success hasCompleted=${result.hasCompleted} hasSpace=${result.spaceId != null} hasInvitation=${result.currentInvitation != null}"
+      )
+      mapOf(
+        "hasCompleted" to result.hasCompleted,
+        "rePairingRequired" to result.rePairingRequired,
+        "spaceId" to result.spaceId,
+        "currentInvitation" to result.currentInvitation?.let {
+          mapOf("invitationCode" to it.invitationCode, "fullInvitation" to it.fullInvitation, "expiresAtMs" to it.expiresAtMs)
+        },
+        "deviceName" to result.deviceName
+      )
+    }
+    AsyncFunction("listDevices") {
+      val engine = requireEngine()
+      val devices = runSpaceRead("listDevices") {
+        refreshAnalyticsContext(engine)
+        val localDeviceId = engine.queryLocalDevice().deviceId
+        engine.listDevices().map {
+          mapOf(
+            "deviceId" to it.deviceId,
+            "displayName" to it.displayName,
+            "isLocal" to (it.deviceId == localDeviceId),
+            "online" to it.online
+          )
+        }
+      }
+      Log.i("UcEngine", "space_read operation=listDevices outcome=success deviceCount=${devices.size}")
+      devices
+    }
+    AsyncFunction("queryDeviceGroupChoices") {
+      try {
+        mapOf(
+          "ok" to true,
+          "value" to runSpaceRead("queryDeviceGroupChoices") { requireEngine().queryDeviceGroupChoices() }
+        )
+      } catch (error: Throwable) {
+        when (error) {
+          is BindingException.Engine -> mapOf(
+            "ok" to false,
+            "failure" to engineFailureMap(error)
+          )
+          else -> throw error
+        }
+      }
+    }
+    AsyncFunction("chooseDeviceGroup") {
+      issueId: String, choiceId: String, expectedRevision: Long, confirmLocalRemoval: Boolean ->
+      require(expectedRevision >= 0) { "Invalid device group revision" }
+      requireEngine().chooseDeviceGroup(issueId, choiceId, expectedRevision.toULong(), confirmLocalRemoval)
+    }
+    AsyncFunction("removeMember") { deviceId: String ->
+      val engine = requireEngine()
+      val result = engine.removeMember(deviceId)
+      refreshAnalyticsContext(engine)
+      workspaceConvergenceMap(result)
+    }
+    AsyncFunction("resendEntry") { entryId: String, targetDevices: List<String>, confirmNewTransfer: Boolean ->
+      engineResult { resendOutcomeMap(requireEngine().resendEntry(entryId, targetDevices, confirmNewTransfer)) }
+    }
+    AsyncFunction("leaveSpace") {
+      val engine = requireEngine()
+      engine.leaveSpace()
+      refreshAnalyticsContext(engine)
+    }
+    AsyncFunction("sendText") { text: String, targetDevices: List<String> ->
+      sendReportMap(requireEngine().sendText(text, targetDevices))
+    }
+    AsyncFunction("sendImage") { bytes: ByteArray, mimeType: String, targetDevices: List<String> ->
+      sendReportMap(requireEngine().sendImage(bytes, mimeType, targetDevices))
+    }
+    Function("registerInputFile") { uri: String, displayName: String? ->
+      requireFiles().register(uri, false, displayName)
+    }
+    Function("registerOutputFile") { uri: String -> requireFiles().register(uri, true) }
+    Function("releaseFileHandle") { handle: String -> requireFiles().remove(handle) }
+    AsyncFunction("sendFiles") { fileHandles: List<String>, targetDevices: List<String> ->
+      sendReportMap(requireEngine().sendFiles(fileHandles, targetDevices))
+    }
+    AsyncFunction("captureCurrentClipboard") { requireEngine().captureCurrentClipboard() }
+    AsyncFunction("observeClipboardChange") { dispatch: Boolean, captured: Map<String, String>? ->
+      val handoff = captured?.let {
+        CapturedClipboard(it["text"], it["fileUri"], it["mimeType"], it["displayName"])
+      }
+      // Counts only: clipboard content never reaches the logs.
+      android.util.Log.i(
+        "UcClipboardObserve",
+        "observe dispatch=$dispatch captured=${if (handoff == null) "none" else if (handoff.fileUri != null) "file" else "text"} bytes=${handoff?.text?.length ?: 0}"
+      )
+      CapturedClipboardHandoff.whileStaged(handoff) {
+        requireEngine().observeClipboardChange(dispatch)?.let(::sendReportMap).also {
+          android.util.Log.i("UcClipboardObserve", "observe finished report=${it != null}")
+        }
+      }
+    }
+    AsyncFunction("restoreClipboard") { entryId: String, mode: String ->
+      restoreOutcome(requireEngine().restoreClipboard(entryId, restoreMode(mode)))
+    }
+    AsyncFunction("exportEntry") { entryId: String, destinationHandle: String ->
+      requireEngine().exportEntry(entryId, destinationHandle)
+    }
+    AsyncFunction("queryOutboundProgress") { entryId: String, targetDeviceId: String ->
+      engineResult { mapOf("progress" to requireEngine().queryOutboundProgress(entryId, targetDeviceId)?.let(::outboundProgressMap)) }
+    }
+    AsyncFunction("listOutboundProgress") {
+      engineResult { mapOf("progress" to requireEngine().listOutboundProgress().map(::outboundProgressMap)) }
+    }
+    AsyncFunction("reconcileOutboundProgress") { entryId: String, targetDeviceId: String, expectedAttemptId: String? ->
+      engineResult { mapOf("state" to requireEngine().reconcileOutboundProgress(entryId, targetDeviceId, expectedAttemptId)) }
+    }
+    AsyncFunction("queryEntryReceiveProgress") { entryId: String ->
+      requireEngine().queryEntryReceiveProgress(entryId)?.let(::receiveProgressMap)
+    }
+    AsyncFunction("listEntryReceiveProgress") {
+      requireEngine().listEntryReceiveProgress().map(::receiveProgressMap)
+    }
+    AsyncFunction("retryEntryReceive") {
+      entryId: String, expectedAttemptId: String, itemIds: List<String> ->
+      engineResult {
+        receiveRetryOutcomeMap(
+          requireEngine().retryEntryReceive(entryId, expectedAttemptId, itemIds)
+        )
+      }
+    }
+    AsyncFunction("cancelEntryReceive") { entryId: String, attemptId: String ->
+      requireEngine().cancelEntryReceive(entryId, attemptId)
+    }
+
+    OnActivityEntersBackground {
+      EngineDiagnosticBridge.record(BindingHostDiagnosticEvent.Lifecycle(BindingHostLifecycleState.BACKGROUND))
+      diagnostics.record(NativeDiagnosticEvent.APP_BACKGROUND, NativeDiagnosticTrigger.APP_BACKGROUND)
+      EngineOwner.enterBackground(requireContext())
+    }
+    OnActivityEntersForeground {
+      EngineDiagnosticBridge.record(BindingHostDiagnosticEvent.Lifecycle(BindingHostLifecycleState.FOREGROUND))
+      diagnostics.record(NativeDiagnosticEvent.APP_FOREGROUND, NativeDiagnosticTrigger.APP_FOREGROUND)
+      EngineOwner.enterForeground(requireContext())
+    }
+    OnDestroy {
+      // The Engine outlives this runtime while the background service holds it.
+      if (attached) EngineOwner.runtimeDetached(attachedContext ?: appContext.reactContext?.applicationContext)
+      attached = false
+      attachedContext = null
+    }
+  }
+
+  private fun analyticsHost(context: Context, appVersion: String? = null): AndroidPostHogAnalyticsHost =
+    EngineOwner.analyticsHost(context, appVersion)
+
+  private fun refreshAnalyticsContext(engine: MobileEngine, appVersion: String? = null) =
+    EngineOwner.refreshAnalyticsContext(engine, appVersion)
+
+  private fun applicationVersion(): String = runCatching {
+    val context = requireContext()
+    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
+  }.getOrDefault("unknown")
+
+  private fun requireContext(): Context =
+    appContext.reactContext?.applicationContext ?: throw UcEngineUnavailableException()
+
+  private fun requireEngine(): MobileEngine = EngineOwner.engine() ?: throw UcEngineNotStartedException()
+
+  private fun requireFiles(): FileHandleRegistry = EngineOwner.files() ?: throw UcEngineNotStartedException()
+
+  private fun <T> runSpaceRead(operation: String, read: () -> T): T = try {
+    read()
+  } catch (error: Throwable) {
+    reportSpaceReadError(operation, error)
+    throw error
+  }
+
+  private fun reportSpaceReadError(operation: String, error: Throwable) {
+    when (error) {
+      is BindingException.Engine -> Log.e(
+        "UcEngine",
+        "space_read operation=$operation outcome=failure errorKind=engine errorCode=${error.code} errorCategory=${error.category} retryable=${error.retryable}"
+      )
+      else -> Log.e(
+        "UcEngine",
+        "space_read operation=$operation outcome=failure errorKind=${error.javaClass.simpleName}"
+      )
+    }
+  }
+
+  private fun sendReportMap(report: SendReport): Map<String, Any> = mapOf(
+    "entryId" to report.entryId,
+    "atMs" to report.atMs,
+    "totalAccepted" to report.totalAccepted.toLong(),
+    "totalDuplicate" to report.totalDuplicate.toLong(),
+    "totalOffline" to report.totalOffline.toLong(),
+    "totalErrored" to report.totalErrored.toLong(),
+    "totalPending" to report.totalPending.toLong()
+  )
+
+  private fun resendOutcomeMap(outcome: ResendEntryOutcome): Map<String, Any> = when (outcome) {
+    is ResendEntryOutcome.Completed -> mapOf(
+      "kind" to "completed",
+      "reconciled" to outcome.reconciled.map(::resendTargetProgressMap),
+      "accepted" to outcome.accepted.toLong(),
+      "duplicate" to outcome.duplicate.toLong(),
+      "offline" to outcome.offline.toLong(),
+      "errored" to outcome.errored.toLong(),
+      "pending" to outcome.pending.toLong()
+    )
+    ResendEntryOutcome.SynchronizationDisabled -> mapOf("kind" to "synchronizationDisabled")
+    is ResendEntryOutcome.EntryNotFound ->
+      mapOf("kind" to "entryNotFound", "entryId" to outcome.entryId)
+    is ResendEntryOutcome.EntryNotResendable -> mapOf(
+      "kind" to "entryNotResendable",
+      "entryId" to outcome.entryId,
+      "reason" to when (outcome.reason) {
+        EntryNotResendableReason.REMOTE_ORIGIN -> "remoteOrigin"
+        EntryNotResendableReason.PAYLOAD_LOST -> "payloadLost"
+      }
+    )
+    is ResendEntryOutcome.TargetNotTrusted ->
+      mapOf("kind" to "targetNotTrusted", "deviceId" to outcome.deviceId)
+    ResendEntryOutcome.NoEligibleTargets -> mapOf("kind" to "noEligibleTargets")
+  }
+
+  private fun outboundProgressMap(progress: OutboundProgress): Map<String, Any?> = mapOf(
+    "entryId" to progress.entryId,
+    "targetDeviceId" to progress.targetDeviceId,
+    "attemptId" to progress.attemptId,
+    "revision" to progress.revision.toString(),
+    "freshness" to progress.freshness,
+    "freshnessAvailable" to progress.freshnessAvailable,
+    "state" to progress.state,
+    "itemsTotal" to progress.itemsTotal.toLong(),
+    "itemsWaiting" to progress.itemsWaiting.toLong(),
+    "itemsRunning" to progress.itemsRunning.toLong(),
+    "itemsCompleted" to progress.itemsCompleted.toLong(),
+    "itemsFailed" to progress.itemsFailed.toLong(),
+    "itemsCancelled" to progress.itemsCancelled.toLong(),
+    "itemsUnconfirmed" to progress.itemsUnconfirmed.toLong(),
+    "items" to progress.items.map { item ->
+      mapOf(
+        "kind" to item.kind,
+        "index" to item.index.toInt(),
+        "state" to item.state,
+        "lastKnownPhase" to item.lastKnownPhase,
+        "round" to item.round?.toLong(),
+        "completedBytes" to item.completedBytes?.toString(),
+        "totalBytes" to item.totalBytes?.toString(),
+        "failureReason" to item.failureReason,
+        "cancellationReason" to item.cancellationReason,
+      )
+    }
+  )
+  private fun resendTargetProgressMap(target: ResendTargetProgress): Map<String, Any?> = mapOf(
+    "targetDeviceId" to target.targetDeviceId,
+    "state" to target.state,
+    "current" to target.current?.let(::outboundProgressMap),
+    "newTransferRequested" to target.newTransferRequested,
+    "duplicateFilesPossible" to target.duplicateFilesPossible
+  )
+
+  private fun receiveProgressMap(progress: ReceiveProgress): Map<String, Any?> = mapOf(
+    "entryId" to progress.entryId,
+    "attemptId" to progress.attemptId,
+    "state" to progress.state,
+    "totalBytes" to progress.totalBytes,
+    "completedBytes" to progress.completedBytes,
+    "itemsTotal" to progress.itemsTotal.toLong(),
+    "itemsCompleted" to progress.itemsCompleted.toLong(),
+    "items" to progress.items.map { item ->
+      mapOf(
+        "itemId" to item.itemId,
+        "kind" to item.kind,
+        "state" to item.state,
+        "failureReason" to item.failureReason
+      )
+    }
+  )
+
+  private fun receiveRetryOutcomeMap(outcome: ReceiveRetryOutcome): Map<String, Any> = when (outcome) {
+    is ReceiveRetryOutcome.Accepted ->
+      mapOf("kind" to "accepted", "attemptId" to outcome.attemptId)
+    ReceiveRetryOutcome.AlreadyReceiving -> mapOf("kind" to "alreadyReceiving")
+    ReceiveRetryOutcome.Superseded -> mapOf("kind" to "superseded")
+    ReceiveRetryOutcome.CancellationIncomplete -> mapOf("kind" to "cancellationIncomplete")
+    is ReceiveRetryOutcome.Unavailable ->
+      mapOf("kind" to "unavailable", "reason" to outcome.reason)
+  }
+
+  private fun failureMap(failure: BindingFailure): Map<String, Any> = mapOf(
+    "code" to failure.code.toLong(),
+    "category" to failure.category.name,
+    "retryable" to failure.retryable
+  )
+
+  /** Reports an Engine failure as data so JS reads code, category and retryable from fields. */
+  private inline fun engineResult(block: () -> Any?): Map<String, Any?> = try {
+    mapOf("ok" to true, "value" to block())
+  } catch (error: BindingException.Engine) {
+    mapOf("ok" to false, "failure" to engineFailureMap(error))
+  }
+
+  private fun engineFailureMap(failure: BindingException.Engine): Map<String, Any> = mapOf(
+    "code" to failure.code.toLong(),
+    "category" to failure.category.name,
+    "retryable" to failure.retryable
+  )
+
+  private fun eventMap(event: BindingEvent): Map<String, Any?> = when (event) {
+    is BindingEvent.StateChanged -> mapOf(
+      "type" to "stateChanged",
+      "state" to stateName(event.state)
+    )
+    is BindingEvent.OperationFinished -> mapOf(
+      "type" to "operationFinished",
+      "operationId" to event.operationId,
+      "terminal" to event.terminal.name,
+      "failure" to event.failure?.let(::failureMap)
+    )
+    is BindingEvent.LifecycleFailed -> mapOf(
+      "type" to "lifecycleFailed",
+      "action" to lifecycleActionName(event.action),
+      "failure" to failureMap(event.failure)
+    )
+    is BindingEvent.RefreshRequired -> mapOf(
+      "type" to "refreshRequired",
+      "reason" to event.reason.name
+    )
+    is BindingEvent.Fatal -> mapOf("type" to "fatal", "failure" to failureMap(event.failure))
+    is BindingEvent.IncomingEntry -> mapOf(
+      "type" to "incomingEntry",
+      "entryId" to event.entryId,
+      "attemptId" to event.attemptId,
+      "preview" to event.preview,
+      "origin" to event.origin.name.lowercase()
+    )
+    is BindingEvent.IncomingPending -> mapOf(
+      "type" to "incomingPending",
+      "entryId" to event.entryId,
+      "attemptId" to event.attemptId,
+      "fromDevice" to event.fromDevice,
+      "totalBytes" to event.totalBytes?.toLong(),
+      "filenames" to event.filenames
+    )
+    is BindingEvent.ReceiveAttemptStateChanged -> mapOf(
+      "type" to "receiveAttemptStateChanged",
+      "entryId" to event.entryId,
+      "attemptId" to event.attemptId,
+      "state" to event.state
+    )
+    is BindingEvent.DeliveryStatusChanged -> mapOf(
+      "type" to "deliveryStatusChanged",
+      "entryId" to event.entryId,
+      "targetDeviceId" to event.targetDeviceId
+    )
+    is BindingEvent.PeerPresenceChanged -> mapOf(
+      "type" to "peerPresenceChanged",
+      "deviceId" to event.deviceId,
+      "state" to event.state,
+      "atMs" to event.atMs
+    )
+    BindingEvent.OutboundProgressChanged -> mapOf("type" to "outboundProgressChanged")
+    BindingEvent.ReceiveProgressChanged -> mapOf("type" to "receiveProgressChanged")
+    is BindingEvent.TransferProgress -> mapOf(
+      "type" to "transferProgress",
+      "transferId" to event.transferId,
+      "entryId" to event.entryId,
+      "attemptId" to event.attemptId,
+      "peerId" to event.peerId,
+      "direction" to event.direction.name.lowercase(),
+      "completedBytes" to event.completedBytes.toLong(),
+      "totalBytes" to event.totalBytes?.toLong()
+    )
+    is BindingEvent.TransferStatusChanged -> mapOf(
+      "type" to "transferStatusChanged",
+      "transferId" to event.transferId,
+      "entryId" to event.entryId,
+      "attemptId" to event.attemptId,
+      "status" to event.status,
+      "reason" to event.reason
+    )
+    is BindingEvent.ActiveClipboardChanged -> mapOf(
+      "type" to "activeClipboardChanged",
+      "snapshotHash" to event.snapshotHash,
+      "entryId" to event.entryId,
+      "activatedAtMs" to event.activatedAtMs,
+      "activatedBy" to event.activatedBy
+    )
+    is BindingEvent.DeviceTrustChanged -> mapOf(
+      "type" to "deviceTrustChanged",
+      "revision" to event.revision.toLong()
+    )
+    is BindingEvent.RePairingRequired -> mapOf(
+      "type" to "rePairingRequired",
+      "scope" to when (event.scope) {
+        BindingRePairingScope.ALL_DEVICES -> "allDevices"
+      }
+    )
+    is BindingEvent.NetworkRecoveryChanged -> mapOf(
+      "type" to "networkRecoveryChanged",
+      "phase" to event.phase,
+      "retryable" to event.retryable,
+      "nextRetryInMs" to event.nextRetryInMs?.toLong()
+    )
+    is BindingEvent.Changed -> mapOf("type" to "changed", "kind" to event.kind)
+  }
+
+  private fun lifecycleActionName(action: BindingLifecycleAction): String = when (action) {
+    BindingLifecycleAction.SUSPEND -> "suspend"
+    BindingLifecycleAction.RESUME -> "resume"
+  }
+
+  private fun stateName(state: BindingEngineState): String = when (state) {
+    BindingEngineState.RUNNING -> "running"
+    BindingEngineState.QUIESCING -> "quiescing"
+    BindingEngineState.QUIESCED -> "quiesced"
+    BindingEngineState.SUSPENDED -> "suspended"
+    BindingEngineState.SHUTTING_DOWN -> "shuttingDown"
+    BindingEngineState.STOPPED -> "stopped"
+  }
+
+  private fun restoreMode(value: String): BindingClipboardRestoreMode = when (value) {
+    "plainText" -> BindingClipboardRestoreMode.PLAIN_TEXT
+    "filePaths" -> BindingClipboardRestoreMode.FILE_PATHS
+    else -> BindingClipboardRestoreMode.STANDARD
+  }
+
+  private fun restoreOutcome(value: BindingClipboardRestoreOutcome): String = when (value) {
+    BindingClipboardRestoreOutcome.RESTORED -> "restored"
+    BindingClipboardRestoreOutcome.PAYLOAD_UNAVAILABLE -> "payloadUnavailable"
+    BindingClipboardRestoreOutcome.NOT_APPLICABLE -> "notApplicable"
+  }
+}
+
+private class AndroidEngineLifecycle(private val engine: MobileEngine, private val diagnostics: NativeRuntimeDiagnostics) : EngineLifecycle {
+  override fun recoverSession(): EngineSessionRecovery {
+    val recovery = AndroidNativeDiagnostics.observe(diagnostics, NativeDiagnosticEvent.SECURE_STATE_RECOVERY) {
+      engine.recoverSession(true)
+    }
+    return EngineSessionRecovery(recovery.unlocked, recovery.resumed)
+  }
+
+  override fun lifecycleState(): EngineLifecycleState = when (engine.lifecycleState()) {
+    BindingEngineState.RUNNING -> EngineLifecycleState.RUNNING
+    BindingEngineState.QUIESCING -> EngineLifecycleState.QUIESCING
+    BindingEngineState.QUIESCED -> EngineLifecycleState.QUIESCED
+    BindingEngineState.SUSPENDED -> EngineLifecycleState.SUSPENDED
+    BindingEngineState.SHUTTING_DOWN -> EngineLifecycleState.SHUTTING_DOWN
+    BindingEngineState.STOPPED -> EngineLifecycleState.STOPPED
+  }
+
+  override fun suspend(deadlineMs: ULong) = AndroidNativeDiagnostics.observe(diagnostics, NativeDiagnosticEvent.ENGINE_SUSPEND) {
+    EngineOwner.suspendOwned(engine, deadlineMs)
+  }
+
+  override fun resume() = AndroidNativeDiagnostics.observe(diagnostics, NativeDiagnosticEvent.ENGINE_RESUME) { engine.resume() }
+}
+
+private class AndroidStartupLifecycle(private val lifecycle: MobileStartupLifecycle) : EngineLifecycle {
+  override val isStartupLifecycle = true
+  override fun recoverSession() = EngineSessionRecovery(unlocked = false, resumed = false)
+  override fun lifecycleState() = EngineLifecycleState.RUNNING
+  override fun suspend(deadlineMs: ULong) = lifecycle.suspendWithDeadline(deadlineMs)
+  override fun resume() = lifecycle.resume()
+}
+
+private class AndroidEngineHost(
+  private val context: Context,
+  private val files: FileHandleRegistry
+) : BindingHost {
+  private val secureStorage = KeystoreSecureStorage(context)
+
+  override fun privateDataDirectory(): String = directory(context.filesDir, "uc-engine").absolutePath
+  override fun cacheDirectory(): String = directory(context.cacheDir, "uc-engine").absolutePath
+  override fun temporaryDirectory(): String = directory(context.cacheDir, "uc-engine-tmp").absolutePath
+
+  override fun secureStorageGet(key: String): ByteArray? = secureStorage.get(key)
+  override fun secureStorageSet(key: String, value: ByteArray) = secureStorage.set(key, value)
+  override fun secureStorageDelete(key: String) = secureStorage.delete(key)
+  override fun fileMetadata(handle: String): BindingFileMetadata = files.metadata(handle)
+  override fun fileReadChunk(handle: String, offset: ULong, maxBytes: UInt): ByteArray =
+    files.read(handle, offset.toLong(), maxBytes.toInt())
+  override fun fileWriteChunk(handle: String, offset: ULong, bytes: ByteArray) =
+    files.write(handle, offset.toLong(), bytes)
+  override fun fileFinishWrite(handle: String) = files.finishWrite(handle)
+
+  override fun clipboardRead(): BindingClipboardSnapshot {
+    CapturedClipboardHandoff.current()?.let { return capturedSnapshot(it) }
+    val clipboard = context.getSystemService(ClipboardManager::class.java)
+      ?: throw HostBindingException.Unavailable()
+    try {
+      val item = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+        ?: return BindingClipboardSnapshot(null, System.currentTimeMillis(), emptyList())
+      val uri = item.uri
+      val representations = if (uri != null) {
+        listOf(fileRepresentation(uri.toString(), null, null))
+      } else {
+        val text = item.coerceToText(context)?.toString().orEmpty()
+        listOf(BindingClipboardRepresentation.Inline("text/plain", "text/plain", text.toByteArray()))
+      }
+      return BindingClipboardSnapshot(null, System.currentTimeMillis(), representations)
+    } catch (_: SecurityException) {
+      throw HostBindingException.PermissionDenied()
+    }
+  }
+
+  private fun capturedSnapshot(captured: CapturedClipboard): BindingClipboardSnapshot {
+    val representations = when {
+      captured.fileUri != null -> listOf(fileRepresentation(captured.fileUri, captured.mimeType, captured.displayName))
+      captured.text != null ->
+        listOf(BindingClipboardRepresentation.Inline("text/plain", "text/plain", captured.text.toByteArray()))
+      else -> emptyList()
+    }
+    // The handoff contains no identity captured with these representations.
+    return BindingClipboardSnapshot(null, System.currentTimeMillis(), representations)
+  }
+
+  private fun fileRepresentation(uri: String, mimeType: String?, displayName: String?): BindingClipboardRepresentation {
+    val handle = files.register(uri, false, displayName)
+    val metadata = files.metadata(handle)
+    // A captured file:// path has no content type from the resolver; the extension still names it.
+    val mime = mimeType ?: metadata.mimeType
+      ?: MimeTypeMap.getFileExtensionFromUrl(uri)?.takeIf { it.isNotEmpty() }
+        ?.let { MimeTypeMap.getSingleton().getMimeTypeFromExtension(it.lowercase()) }
+    return BindingClipboardRepresentation.File(
+      mime ?: "application/octet-stream",
+      handle,
+      metadata.displayName,
+      mime,
+      metadata.sizeBytes
+    )
+  }
+
+  override fun clipboardWrite(snapshot: BindingClipboardSnapshot): ByteArray? {
+    val clipboard = context.getSystemService(ClipboardManager::class.java)
+      ?: throw HostBindingException.Unavailable()
+    try {
+      val clip = clipDataForSnapshot(context, files, snapshot.representations)
+      clipboard.setPrimaryClip(clip)
+      // The platform timestamp is not a unique, proven write identity.
+      return null
+    } catch (_: SecurityException) {
+      throw HostBindingException.PermissionDenied()
+    } catch (_: Exception) {
+      throw HostBindingException.Io()
+    }
+  }
+
+  private fun directory(parent: File, name: String): File =
+    File(parent, name).also { if (!it.exists() && !it.mkdirs()) throw HostBindingException.Io() }
+}
+
+internal fun interface SecretKeyProvider {
+  fun get(): SecretKey
+}
+
+private class AndroidKeyStoreSecretKeyProvider(private val alias: String) : SecretKeyProvider {
+  override fun get(): SecretKey {
+    val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    (keyStore.getKey(alias, null) as? SecretKey)?.let { return it }
+    val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+    generator.init(
+      KeyGenParameterSpec.Builder(
+        alias,
+        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+      )
+        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+        .setRandomizedEncryptionRequired(true)
+        .build()
+    )
+    return generator.generateKey()
+  }
+}
+
+internal class KeystoreSecureStorage(
+  context: Context,
+  private val secretKeyProvider: SecretKeyProvider = AndroidKeyStoreSecretKeyProvider(
+    "${context.packageName}.uc-engine.master"
+  )
+) {
+  private val preferences = context.getSharedPreferences("uc_engine_secure", Context.MODE_PRIVATE)
+  private val lock = Any()
+
+  fun get(key: String): ByteArray? = synchronized(lock) {
+    val encoded = preferences.getString(storageId(key), null) ?: return@synchronized null
+    try {
+      val payload = Base64.decode(encoded, Base64.NO_WRAP)
+      val ivSize = payload.first().toInt() and 0xff
+      val iv = payload.copyOfRange(1, ivSize + 1)
+      val ciphertext = payload.copyOfRange(ivSize + 1, payload.size)
+      val secretKey = try {
+        secretKeyProvider.get()
+      } catch (_: Exception) {
+        throw HostBindingException.Unavailable()
+      }
+      val cipher = try {
+        Cipher.getInstance("AES/GCM/NoPadding").also {
+          it.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, iv))
+        }
+      } catch (_: KeyPermanentlyInvalidatedException) {
+        throw HostBindingException.Unavailable()
+      } catch (_: ProviderException) {
+        throw HostBindingException.Unavailable()
+      } catch (_: Exception) {
+        throw HostBindingException.Io()
+      }
+      try {
+        cipher.doFinal(ciphertext)
+      } catch (_: Exception) {
+        throw HostBindingException.Io()
+      }
+    } catch (error: HostBindingException) {
+      throw error
+    } catch (_: Exception) {
+      throw HostBindingException.Io()
+    }
+  }
+
+  fun set(key: String, value: ByteArray) = synchronized(lock) {
+    try {
+      val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+      cipher.init(Cipher.ENCRYPT_MODE, secretKeyProvider.get())
+      val encrypted = cipher.doFinal(value)
+      val payload = ByteBuffer.allocate(1 + cipher.iv.size + encrypted.size)
+        .put(cipher.iv.size.toByte())
+        .put(cipher.iv)
+        .put(encrypted)
+        .array()
+      val storageId = storageId(key)
+      if (!preferences.edit().putString(storageId, Base64.encodeToString(payload, Base64.NO_WRAP)).commit()) {
+        throw HostBindingException.Io()
+      }
+    } catch (error: HostBindingException) {
+      throw error
+    } catch (_: Exception) {
+      throw HostBindingException.Unavailable()
+    }
+  }
+
+  fun delete(key: String) = synchronized(lock) {
+    if (!preferences.edit().remove(storageId(key)).commit()) throw HostBindingException.Io()
+  }
+
+  private fun storageId(key: String): String = Base64.encodeToString(
+    MessageDigest.getInstance("SHA-256").digest(key.toByteArray()),
+    Base64.NO_WRAP or Base64.URL_SAFE
+  )
+}
+
+internal class FileHandleRegistry(private val context: Context) {
+  private data class Entry(val uri: Uri, val writable: Boolean, val displayName: String?)
+  private val entries = ConcurrentHashMap<String, Entry>()
+
+  fun register(value: String, writable: Boolean, displayName: String? = null): String {
+    val parsed = Uri.parse(value)
+    val uri = if (parsed.scheme == null) Uri.fromFile(File(value)) else parsed
+    val handle = UUID.randomUUID().toString()
+    entries[handle] = Entry(uri, writable, displayName)
+    return handle
+  }
+
+  fun remove(handle: String) { entries.remove(handle) }
+  fun removeAll() { entries.clear() }
+  fun uri(handle: String): Uri = entry(handle).uri
+
+  fun metadata(handle: String): BindingFileMetadata {
+    val target = entry(handle)
+    val uri = target.uri
+    try {
+      var name = target.displayName ?: uri.lastPathSegment ?: "file"
+      var size = -1L
+      context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)
+        ?.use { cursor ->
+          if (cursor.moveToFirst()) {
+            cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+              .takeIf { target.displayName == null && it >= 0 }?.let {
+              name = cursor.getString(it) ?: name
+            }
+            cursor.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 && !cursor.isNull(it) }?.let {
+              size = cursor.getLong(it)
+            }
+          }
+        }
+      if (size < 0) size = context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0
+      return BindingFileMetadata(name, size.coerceAtLeast(0).toULong(), context.contentResolver.getType(uri))
+    } catch (_: SecurityException) {
+      throw HostBindingException.PermissionDenied()
+    } catch (_: Exception) {
+      throw HostBindingException.Io()
+    }
+  }
+
+  fun read(handle: String, offset: Long, maxBytes: Int): ByteArray {
+    val uri = entry(handle).uri
+    try {
+      context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+        FileInputStream(descriptor.fileDescriptor).channel.use { channel ->
+          channel.position(offset)
+          val buffer = ByteBuffer.allocate(maxBytes)
+          val count = channel.read(buffer)
+          return if (count <= 0) ByteArray(0) else buffer.array().copyOf(count)
+        }
+      }
+      throw HostBindingException.Io()
+    } catch (error: HostBindingException) {
+      throw error
+    } catch (_: SecurityException) {
+      throw HostBindingException.PermissionDenied()
+    } catch (_: Exception) {
+      throw HostBindingException.Io()
+    }
+  }
+
+  fun write(handle: String, offset: Long, bytes: ByteArray) {
+    val target = entry(handle)
+    if (!target.writable) throw HostBindingException.PermissionDenied()
+    try {
+      context.contentResolver.openFileDescriptor(target.uri, "rw")?.use { descriptor ->
+        FileOutputStream(descriptor.fileDescriptor).channel.use { channel ->
+          channel.position(offset)
+          channel.write(ByteBuffer.wrap(bytes))
+          channel.force(true)
+          return
+        }
+      }
+      throw HostBindingException.Io()
+    } catch (error: HostBindingException) {
+      throw error
+    } catch (_: SecurityException) {
+      throw HostBindingException.PermissionDenied()
+    } catch (_: Exception) {
+      throw HostBindingException.Io()
+    }
+  }
+
+  fun finishWrite(handle: String) {
+    if (!entry(handle).writable) throw HostBindingException.PermissionDenied()
+  }
+
+  private fun entry(handle: String): Entry = entries[handle] ?: throw HostBindingException.InvalidHandle()
+}
+
+private class UcEngineNotStartedException : CodedException("The shared P2P engine has not been started")
+private class UcEngineAlreadyStartedException : CodedException("The shared P2P engine is already running")
+private class UcEngineUnavailableException : CodedException("The Android application context is unavailable")
+private class UcEngineInvalidInputException : CodedException("The device trust choice is invalid")

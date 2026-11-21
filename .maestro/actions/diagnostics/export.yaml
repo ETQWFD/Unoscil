@@ -1,0 +1,46 @@
+appId: ${APP_ID}
+---
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - scrollUntilVisible:
+          element:
+            id: diagnostic-export
+          direction: DOWN
+      - tapOn:
+          id: diagnostic-export
+      # The page's own share icon also reads "Share"; target the dialog's button among its siblings.
+      - tapOn:
+          text: "Share"
+          above: "Send to"
+          rightOf:
+            id: square.and.arrow.up
+      - extendedWaitUntil:
+          visible: "Copy"
+          timeout: 30000
+      - takeScreenshot: diagnostic-share-sheet
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - scrollUntilVisible:
+          element:
+            text: "Export"
+          direction: DOWN
+      - tapOn: "Export"
+      - tapOn: "Export file"
+      - extendedWaitUntil:
+          visible: "(?i)USE THIS FOLDER"
+          timeout: 30000
+      - runFlow:
+          when:
+            notVisible: "(?i)Documents"
+          commands:
+            - tapOn: "Show roots"
+            - tapOn: "sdk_gphone.*|(?i)Internal storage"
+      - tapOn: "(?i)Documents"
+      - tapOn: "(?i)USE THIS FOLDER"
+      - tapOn: "(?i)ALLOW"
+      - assertVisible: "Logs saved"
+      - takeScreenshot: diagnostic-file-saved

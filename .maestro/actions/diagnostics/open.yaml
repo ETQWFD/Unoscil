@@ -1,0 +1,21 @@
+appId: ${APP_ID}
+---
+- runFlow: ../settings/open.yaml
+- scrollUntilVisible:
+    element:
+      id: settings-diagnostics
+    direction: DOWN
+- tapOn:
+    id: settings-diagnostics
+- scrollUntilVisible:
+    element:
+      id: engine-diagnostic-capture
+    direction: DOWN
+- extendedWaitUntil:
+    visible:
+      id: engine-diagnostic-capture
+      enabled: true
+    timeout: 30000
+- extendedWaitUntil:
+    notVisible: ".*Unavailable until the service is ready.*"
+    timeout: 30000
