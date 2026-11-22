@@ -141,3 +141,13 @@ npm run plugin:build
 ## 自动连接验收
 
 [宿主接入与测试记录](docs/tests/automatic-peer-connections.md)说明前台、网络变化及共享 Engine 自动重连的接入与验证边界。
+
+## 预编译产物（artifacts/）
+
+- `Unoscil-2.4.1-armeabi-v7a.apk` — Android 32 位 APK
+- `Unoscil-2.4.1-win32-x64.zip` — Windows x64
+- `Unoscil-2.4.1-linux-x64.tar.gz` — Linux x64
+- `Unoscil-2.4.1-darwin-arm64.zip` — macOS Apple Silicon
+- `Unoscil-2.4.1-darwin-x64.zip` — macOS Intel
+
+大文件通过 Git LFS 存储；Release 页面提供同样的直接下载。签名证书不随仓库分发。
