@@ -145,7 +145,8 @@ npm run plugin:build
 ## 预编译产物（artifacts/）
 
 - `Unoscil-2.4.1-armeabi-v7a.apk` — Android 32 位 APK
-- `Unoscil-2.4.1-win32-x64.zip` — Windows x64
+- `Unoscil-2.4.2-win32-x64.zip` — Windows x64（2.4.2 修复版）
+- `Unoscil-2.4.1-win32-x64.zip` — Windows x64（历史版本）
 - `Unoscil-2.4.1-linux-x64.tar.gz` — Linux x64
 - `Unoscil-2.4.1-darwin-arm64.zip` — macOS Apple Silicon
 - `Unoscil-2.4.1-darwin-x64.zip` — macOS Intel
