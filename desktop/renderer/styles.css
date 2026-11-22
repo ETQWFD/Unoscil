@@ -18,6 +18,10 @@
 
 * { box-sizing: border-box; }
 
+/* 关键修复：作者样式里的 display:grid/flex 会覆盖 hidden 属性，
+   导致“关于”遮罩常驻且无法关闭。这里强制 hidden 生效。 */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -31,6 +35,8 @@ html, body {
 .app { display: flex; flex-direction: column; height: 100vh; }
 
 .appbar {
+  position: relative;
+  z-index: 60;
   -webkit-app-region: drag;
   height: 64px;
   display: flex;
@@ -278,3 +284,14 @@ html, body {
   border: 0; background: transparent; color: var(--accent); font-size: 12.5px; cursor: pointer; padding: 0;
 }
 .link:hover { text-decoration: underline; }
+
+.confirm-sheet { width: 420px; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.confirm-btn {
+  border: 1px solid var(--line-strong); background: var(--bg-elev);
+  color: var(--text); border-radius: 10px; padding: 9px 18px;
+  font-size: 12.5px; cursor: pointer;
+}
+.confirm-btn:hover { border-color: var(--accent); }
+.confirm-btn.primary { background: var(--accent); border-color: var(--accent); color: #08211d; font-weight: 700; }
+.confirm-btn.ghost { background: transparent; }

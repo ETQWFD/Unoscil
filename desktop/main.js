@@ -257,7 +257,10 @@ function registerIpc() {
     if (mainWindow.isMaximized()) mainWindow.unmaximize();
     else mainWindow.maximize();
   });
-  ipcMain.on('window:close', () => mainWindow?.close());
+  // 用 destroy 兜底：即使渲染进程卡死或页面有未关闭的 beforeunload，也一定能退出。
+  ipcMain.on('window:close', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
+  });
 }
 
 const singleInstance = app.requestSingleInstanceLock();

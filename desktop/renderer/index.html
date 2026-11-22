@@ -139,6 +139,24 @@
       </div>
     </div>
 
+    <div class="sheet-backdrop" id="confirm" hidden>
+      <div class="sheet confirm-sheet">
+        <div class="sheet-head">
+          <h2 id="confirm-title">确认操作</h2>
+          <button class="win-btn" id="confirm-x" aria-label="关闭">
+            <svg viewBox="0 0 12 12"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke-width="1.2"/></svg>
+          </button>
+        </div>
+        <div class="sheet-body">
+          <p class="about-desc" id="confirm-text"></p>
+          <div class="confirm-actions">
+            <button class="confirm-btn ghost" id="confirm-cancel">取消</button>
+            <button class="confirm-btn primary" id="confirm-ok">确定</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <script src="app.js"></script>
   </body>
 </html>

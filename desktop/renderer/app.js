@@ -210,7 +210,7 @@ document.getElementById('btn-clear-unpinned').addEventListener('click', async ()
     toast('没有可清理的记录');
     return;
   }
-  const confirmed = window.confirm(`确定清空 ${unpinned} 条未收藏记录吗？此操作不可撤销。`);
+  const confirmed = await askConfirm(`确定清空 ${unpinned} 条未收藏记录吗？此操作不可撤销。`);
   if (!confirmed) return;
   await api.clearUnpinned();
   toast('已清空未收藏记录');
@@ -221,7 +221,7 @@ document.getElementById('btn-clear').addEventListener('click', async () => {
     toast('历史记录已经为空');
     return;
   }
-  const confirmed = window.confirm('确定清空全部剪贴板历史吗？此操作不可撤销。');
+  const confirmed = await askConfirm('确定清空全部剪贴板历史吗？此操作不可撤销。');
   if (!confirmed) return;
   await api.clear();
   toast('已清空全部历史');
@@ -236,6 +236,46 @@ function openSheet() {
 function closeSheet() {
   sheet.hidden = true;
 }
+
+/** 应用内确认框，替代会被窗口管理器卡住的 window.confirm。 */
+function askConfirm(message) {
+  return new Promise((resolve) => {
+    const box = document.getElementById('confirm');
+    const text = document.getElementById('confirm-text');
+    const ok = document.getElementById('confirm-ok');
+    const cancel = document.getElementById('confirm-cancel');
+    const closeX = document.getElementById('confirm-x');
+    text.textContent = message;
+
+    const done = (value) => {
+      box.hidden = true;
+      ok.onclick = null;
+      cancel.onclick = null;
+      closeX.onclick = null;
+      box.onclick = null;
+      document.removeEventListener('keydown', onKey, true);
+      resolve(value);
+    };
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        done(false);
+      }
+    };
+
+    ok.onclick = () => done(true);
+    cancel.onclick = () => done(false);
+    closeX.onclick = () => done(false);
+    box.onclick = (event) => {
+      if (event.target === box) done(false);
+    };
+    document.addEventListener('keydown', onKey, true);
+    box.hidden = false;
+    ok.focus();
+  });
+}
+
 document.getElementById('btn-about').addEventListener('click', openSheet);
 document.getElementById('about-mail').addEventListener('click', () => api.contact());
 document.getElementById('about-datadir').addEventListener('click', () => api.openDataDir());
@@ -259,8 +299,20 @@ api.onHistoryChanged((items) => {
 api.onWindowState(() => {});
 
 (async function init() {
+  closeSheet();
+  document.getElementById('confirm').hidden = true;
   state.info = await api.info();
-  els.aboutVersion.textContent = `版本 ${state.info.version} · Windows 桌面版`;
+  const platformLabel =
+    state.info.platform === 'win32'
+      ? 'Windows 桌面版'
+      : state.info.platform === 'darwin'
+        ? 'macOS 桌面版'
+        : 'Linux 桌面版';
+  els.aboutVersion.textContent = `版本 ${state.info.version} · ${platformLabel}`;
   els.search.focus();
   await refresh();
-})();
+})().catch((error) => {
+  closeSheet();
+  document.getElementById('confirm').hidden = true;
+  toast(`初始化失败：${error?.message || error}`);
+});
